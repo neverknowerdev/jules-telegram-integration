@@ -120,9 +120,19 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("[POLLER] Chat %d: foundLast=%v newActivities=%d", chat.ChatID, foundLast, len(newActivities))
 
+		// Find the boundary of the current work round (latest completion/failure)
+		roundStartIdx := -1
+		for i := len(activities) - 1; i >= 0; i-- {
+			if activities[i].SessionCompleted != nil || activities[i].SessionFailed != nil {
+				roundStartIdx = i
+				break
+			}
+		}
+
 		// Prepare to process activities
 		isWorkStarted := func(planIdx int) bool {
-			for i := 0; i < planIdx; i++ {
+			// Only check for progress within the current round
+			for i := roundStartIdx + 1; i < planIdx; i++ {
 				if activities[i].ProgressUpdated.Title != "" || len(activities[i].Artifacts) > 0 {
 					return true
 				}
@@ -182,15 +192,20 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		// Rebuild and update the progress message if needed
 		if hasNewProgress {
 			lastApprovedPlanIdx := -1
-			for i := len(activities) - 1; i >= 0; i-- {
+			for i := len(activities) - 1; i > roundStartIdx; i-- {
 				if len(activities[i].PlanGenerated.Plan.Steps) > 0 && !executionPlans[activities[i].Id] {
 					lastApprovedPlanIdx = i
 					break
 				}
 			}
 
+			startIdx := roundStartIdx
+			if lastApprovedPlanIdx > roundStartIdx {
+				startIdx = lastApprovedPlanIdx
+			}
+
 			var allProgressLines []string
-			for i := lastApprovedPlanIdx + 1; i < len(activities); i++ {
+			for i := startIdx + 1; i < len(activities); i++ {
 				act := activities[i]
 				if act.Originator == "user" {
 					continue
@@ -205,15 +220,23 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if len(allProgressLines) > 0 {
+			// Slice strictly to last 15 items to prevent Telegram 4096 char limits entirely
+			if len(allProgressLines) > 15 {
+				allProgressLines = allProgressLines[len(allProgressLines)-15:]
+			}
+
+			// Even if 0 progress lines, if we just restarted we may need to post the "working" header
+			if len(allProgressLines) > 0 || progressMsgID == 0 {
 				header := "⚙️ <b>Jules is working on it...</b>\n\n"
-				body := strings.Join(allProgressLines, "\n")
-				msg := trimProgressMessage(header + body)
+				body := strings.Join(allProgressLines, "\n\n")
+				msg := header + body
 
 				if progressMsgID == 0 {
 					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
 						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
-						progressMsgID = msgID
+						chat.ProgressMessageID = msgID // keep local state in sync
+					} else {
+						log.Printf("[POLLER] Chat %d: FAILED to create progress message: %v", chat.ChatID, err)
 					}
 				} else {
 					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
@@ -221,6 +244,9 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 						// If edit fails (e.g. message deleted or too old), try sending a new one
 						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
 							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
+							chat.ProgressMessageID = msgID
+						} else {
+							log.Printf("[POLLER] Chat %d: FAILED to create replacement progress message: %v", chat.ChatID, err)
 						}
 					}
 				}
@@ -349,11 +375,15 @@ func formatProgressLine(act jules.Activity, ts string) string {
 	if act.ProgressUpdated.Title != "" {
 		title := formatTelegramHTML(act.ProgressUpdated.Title)
 		if act.ProgressUpdated.Description != "" {
-			if len(act.ProgressUpdated.Description) > 120 {
-				// Use expandable blockquote — plain text inside to avoid nesting issues
-				return fmt.Sprintf("[%s] ✅ <b>%s</b>\n<blockquote expandable>%s</blockquote>", ts, title, escapeHTML(act.ProgressUpdated.Description))
+			descText := act.ProgressUpdated.Description
+			if len(descText) > 400 {
+				descText = descText[:400] + "..."
 			}
-			desc := formatTelegramHTML(act.ProgressUpdated.Description)
+			if len(descText) > 120 {
+				// Use expandable blockquote — plain text inside to avoid nesting issues
+				return fmt.Sprintf("[%s] ✅ <b>%s</b>\n<blockquote expandable>%s</blockquote>", ts, title, escapeHTML(descText))
+			}
+			desc := formatTelegramHTML(descText)
 			return fmt.Sprintf("[%s] ✅ <b>%s</b>\n<i>%s</i>", ts, title, desc)
 		}
 		return fmt.Sprintf("[%s] ✅ <b>%s</b>", ts, title)
@@ -406,29 +436,8 @@ func formatTimestamp(createTime string) string {
 }
 
 func trimProgressMessage(msg string) string {
-	const maxLen = 4000 // Telegram limit is 4096, leave room for safety
-	if len(msg) <= maxLen {
-		return msg
-	}
-
-	// Find the header end
-	headerEnd := strings.Index(msg, "\n\n")
-	if headerEnd < 0 {
-		headerEnd = 0
-	} else {
-		headerEnd += 2
-	}
-
-	header := msg[:headerEnd]
-	body := msg[headerEnd:]
-
-	// Trim oldest lines from body until it fits
-	lines := strings.Split(body, "\n")
-	for len(header)+len(strings.Join(lines, "\n")) > maxLen && len(lines) > 1 {
-		lines = lines[1:]
-	}
-
-	return header + "...\n" + strings.Join(lines, "\n")
+	// Not used anymore due to array slicing. Returning untouched text.
+	return msg
 }
 
 func formatTelegramHTML(md string) string {
