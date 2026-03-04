@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
@@ -54,106 +55,185 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	chats, err := firestoreClient.GetAllChats(ctx)
-	if err != nil {
-		log.Printf("Failed to get chats: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
+	// Check poller lock
+	pollerState, err := firestoreClient.GetPollerState(ctx)
+	now := time.Now().Unix()
+	if err == nil && pollerState != nil {
+		// If another instance updated the heartbeat within the last 15 seconds, exit
+		if now-pollerState.LastHeartbeat < 15 {
+			log.Println("Another long-running poller instance is active. Exiting.")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 
-	for _, chat := range chats {
-		if chat.CurrentSession == "" {
-			continue
+	// Calculate a deadline for the function to stop before Cloud Functions timeout (e.g. 55 mins)
+	deadline := time.Now().Add(55 * time.Minute)
+
+	for {
+		if time.Now().After(deadline) {
+			log.Println("Approaching function timeout, exiting loop.")
+			break
 		}
 
-		activities, err := julesClient.ListActivities(chat.CurrentSession)
+		// Update heartbeat
+		firestoreClient.UpdatePollerHeartbeat(ctx, time.Now().Unix())
+
+		chats, err := firestoreClient.GetAllChats(ctx)
 		if err != nil {
-			log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
-			continue
+			log.Printf("Failed to get chats: %v", err)
+			break
 		}
 
-		if len(activities) == 0 {
-			continue
-		}
+		minInteractiveInterval := 999999
 
-		// Find new activities (activities are returned newest first usually)
-		var newActivities []jules.Activity
-		foundLast := false
-
-		// If chat has no last activity recorded, we treat all as new (or limit them)
-		// But to avoid spam on fresh start/switch, we might want to just mark the latest and return?
-		// User requirement: "Receive every update".
-		// If I switch to a task, I probably want to see its status.
-		// Let's implement the "Top 5" heuristic if LastActivityID is not found.
-
-		for _, act := range activities {
-			if act.Id == chat.LastActivityID {
-				foundLast = true
-				break
+		for _, chat := range chats {
+			if chat.CurrentSession == "" {
+				continue
 			}
-			newActivities = append(newActivities, act)
-		}
 
-		// If we found the last activity, we send all new ones.
-		// If we DIDN'T find it, it implies either:
-		// 1. It's a new session for the bot (LastActivityID is empty or from another session).
-		// 2. The LastActivityID is too old and fell off the first page.
-		// In case 2, we risk duplication if we send everything? No, if it's not in the list, then everything in the list is NEWER (assuming list is desc).
-		// So actually we should send ALL.
-		// EXCEPT if LastActivityID was empty (first run).
+			if chat.IsWaitingForJules {
+				if chat.InteractiveInterval > 0 && chat.InteractiveInterval < minInteractiveInterval {
+					minInteractiveInterval = chat.InteractiveInterval
+				}
+			} else {
+				// Throttle standard polling
+				sinceLastPoll := time.Now().Unix() - chat.LastStandardPoll
+				standardIntervalSecs := int64(chat.StandardInterval) * 60
+				if chat.LastStandardPoll > 0 && sinceLastPoll < standardIntervalSecs {
+					// Skip this chat until its standard interval has passed
+					continue
+				}
+			}
 
-		if !foundLast && chat.LastActivityID == "" {
-			// First run for this session. Just mark the latest and don't spam.
-			// Or maybe send the very latest one as a "Status"?
-			// Let's just update the cursor to the latest so we only get NEW updates from now on.
-			if len(activities) > 0 {
+			activities, err := julesClient.ListActivities(chat.CurrentSession)
+			if err != nil {
+				log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
+				continue
+			}
+
+			if !chat.IsWaitingForJules {
+				firestoreClient.UpdateLastStandardPoll(ctx, chat.ChatID, time.Now().Unix())
+			}
+
+			if len(activities) == 0 {
+				continue
+			}
+
+			absoluteLatest := activities[0]
+			julesWorking := false
+
+			// Determine if the task is currently active/processing based on the absolute latest activity
+			if absoluteLatest.Originator == "user" {
+				julesWorking = true
+			} else if absoluteLatest.Originator == "agent" || absoluteLatest.Originator == "system" {
+				if absoluteLatest.ProgressUpdated.Title != "" {
+					julesWorking = true
+				}
+			}
+
+			if chat.IsWaitingForJules && !julesWorking {
+				// Jules finished. Reset flag to false immediately.
+				firestoreClient.UpdateIsWaitingForJules(ctx, chat.ChatID, false)
+				chat.IsWaitingForJules = false
+			} else if !chat.IsWaitingForJules && julesWorking {
+				// We detected an active task during standard polling. Switch to interactive mode.
+				firestoreClient.UpdateIsWaitingForJules(ctx, chat.ChatID, true)
+				chat.IsWaitingForJules = true
+				if chat.InteractiveInterval > 0 && chat.InteractiveInterval < minInteractiveInterval {
+					minInteractiveInterval = chat.InteractiveInterval
+				}
+			}
+
+			var newActivities []jules.Activity
+			foundLast := false
+
+			for _, act := range activities {
+				if act.Id == chat.LastActivityID {
+					foundLast = true
+					break
+				}
+				newActivities = append(newActivities, act)
+			}
+
+			if !foundLast && chat.LastActivityID == "" {
+				if len(activities) > 0 {
+					firestoreClient.UpdateLastActivity(ctx, chat.ChatID, activities[0].Id)
+				}
+				continue
+			}
+
+			if !foundLast && len(newActivities) > 5 {
+				newActivities = newActivities[:5]
+			}
+
+			if len(newActivities) == 0 {
+				continue
+			}
+
+			// Reverse
+			for i, j := 0, len(newActivities)-1; i < j; i, j = i+1, j-1 {
+				newActivities[i], newActivities[j] = newActivities[j], newActivities[i]
+			}
+
+			julesFinished := false
+
+			for _, act := range newActivities {
+				msg := formatActivity(act)
+				if act.PlanGenerated.Plan.Title != "" {
+					sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+					keyboard := telegram.InlineKeyboardMarkup{
+						InlineKeyboard: [][]telegram.InlineKeyboardButton{
+							{
+								{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort},
+							},
+						},
+					}
+					telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
+				} else {
+					telegramClient.SendMessage(chat.ChatID, msg)
+				}
+
+				// Check if Jules is done
+				if act.Originator == "agent" || act.Originator == "system" {
+					if act.ProgressUpdated.Title == "" {
+						// It's not just a progress update, so Jules likely finished (PlanGenerated or AgentMessaged)
+						julesFinished = true
+					}
+				}
+			}
+
+			if len(newActivities) > 0 {
 				firestoreClient.UpdateLastActivity(ctx, chat.ChatID, activities[0].Id)
 			}
-			continue
-		}
 
-		// If not found but ID was set (switched session or gap), we send all (or limit to avoid spam).
-		if !foundLast && len(newActivities) > 5 {
-			// Limit to 5 to avoid spam
-			newActivities = newActivities[:5]
-		}
-
-		if len(newActivities) == 0 {
-			continue
-		}
-
-		// Reverse to send oldest first
-		for i, j := 0, len(newActivities)-1; i < j; i, j = i+1, j-1 {
-			newActivities[i], newActivities[j] = newActivities[j], newActivities[i]
-		}
-
-		for _, act := range newActivities {
-			msg := formatActivity(act)
-			if act.PlanGenerated.Plan.Title != "" {
-				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-				keyboard := telegram.InlineKeyboardMarkup{
-					InlineKeyboard: [][]telegram.InlineKeyboardButton{
-						{
-							{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort},
-						},
-					},
-				}
-				telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
-			} else {
-				telegramClient.SendMessage(chat.ChatID, msg)
+			if chat.IsWaitingForJules && julesFinished {
+				firestoreClient.UpdateIsWaitingForJules(ctx, chat.ChatID, false)
 			}
 		}
 
-		// Update LastActivityID to the newest one processed
-		if len(newActivities) > 0 {
-			// The newest one is the LAST one in the reversed list?
-			// No, the newest one is the FIRST one in the original list (activities[0]).
-			// Or newActivities[len-1] after reverse.
-			// Better: activities[0].Id is the absolute newest in the fetch.
-			// But if we limited the list, we should update to the one we actually processed?
-			// No, we should update to the absolute newest to avoid processing the skipped ones again.
-			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, activities[0].Id)
+		// Re-fetch chats to see if they are still waiting after processing
+		// to avoid infinite loops when we set IsWaitingForJules to false
+		chatsAfter, _ := firestoreClient.GetAllChats(ctx)
+		anyWaitingNow := false
+		for _, c := range chatsAfter {
+			if c.IsWaitingForJules {
+				anyWaitingNow = true
+				break
+			}
 		}
+
+		if !anyWaitingNow {
+			log.Println("No tasks waiting for Jules. Exiting long-running poller.")
+			break
+		}
+
+		if minInteractiveInterval == 999999 {
+			minInteractiveInterval = 5
+		}
+
+		// Sleep for the minimum interactive interval across waiting chats
+		time.Sleep(time.Duration(minInteractiveInterval) * time.Second)
 	}
 
 	w.WriteHeader(http.StatusOK)

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/api/idtoken"
+
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
@@ -433,6 +435,29 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, "✅ Plan approved successfully!")
+			// Send to poller
+			firestoreClient.UpdateIsWaitingForJules(ctx, chatID, true)
+			triggerPoller()
+		}
+		return
+	}
+
+	// Handle Settings callbacks
+	if strings.HasPrefix(data, "settings:") {
+		settingType := strings.TrimPrefix(data, "settings:")
+		telegramClient.AnswerCallbackQuery(callbackID, "")
+
+		// Store which setting we're changing
+		err := firestoreClient.UpdateChatState(ctx, chatID, "waiting_for_setting:"+settingType, "")
+		if err != nil {
+			log.Printf("Failed to update state: %v", err)
+			return
+		}
+
+		if settingType == "interactive" {
+			telegramClient.SendMessage(chatID, "Enter new interval for Interactive mode (in seconds, e.g., 5):")
+		} else if settingType == "standard" {
+			telegramClient.SendMessage(chatID, "Enter new interval for Standard mode (in minutes, e.g., 5):")
 		}
 		return
 	}
@@ -557,6 +582,10 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 						{Text: "🗓 Show Tasks"},
 						{Text: "➕ New Task"},
 					},
+					{
+						{Text: "🔄 Refresh"},
+						{Text: "⚙️ Settings"},
+					},
 				},
 				ResizeKeyboard: true,
 				IsPersistent:   true,
@@ -587,6 +616,10 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 						{Text: "🗓 Show Tasks"},
 						{Text: "➕ New Task"},
 					},
+					{
+						{Text: "🔄 Refresh"},
+						{Text: "⚙️ Settings"},
+					},
 				},
 				ResizeKeyboard: true,
 				IsPersistent:   true,
@@ -594,6 +627,35 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 			telegramClient.SendMessageWithReplyKeyboard(chatID, "✅ Session archived successfully.", keyboard)
 			return
 		}
+		return
+	}
+
+	if text == "⚙️ Settings" {
+		if chatConfig == nil {
+			return
+		}
+		var buttons [][]telegram.InlineKeyboardButton
+		buttons = append(buttons, []telegram.InlineKeyboardButton{
+			{Text: fmt.Sprintf("Interactive: %ds", chatConfig.InteractiveInterval), CallbackData: "settings:interactive"},
+			{Text: fmt.Sprintf("Standard: %dm", chatConfig.StandardInterval), CallbackData: "settings:standard"},
+		})
+		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: buttons}
+		telegramClient.SendMessageWithKeyboard(chatID, "⚙️ <b>Settings</b>\n\nClick on a button below to change the interval:", keyboard)
+		return
+	}
+
+	if text == "🔄 Refresh" {
+		if chatConfig == nil || chatConfig.CurrentSession == "" {
+			telegramClient.SendMessage(chatID, "No active session to refresh.")
+			return
+		}
+		telegramClient.SendMessage(chatID, "🔄 Checking for updates...")
+
+		// Set waiting for jules to true so the poller loop will pick it up
+		firestoreClient.UpdateIsWaitingForJules(ctx, chatID, true)
+
+		// Trigger the poller
+		triggerPoller()
 		return
 	}
 
@@ -633,6 +695,35 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 		return
 	}
 
+	// Handle setting input
+	if err == nil && strings.HasPrefix(chatConfig.State, "waiting_for_setting:") {
+		settingType := strings.TrimPrefix(chatConfig.State, "waiting_for_setting:")
+		var val int
+		if _, err := fmt.Sscanf(text, "%d", &val); err != nil || val <= 0 {
+			telegramClient.SendMessage(chatID, "Invalid number. Settings unchanged.")
+			firestoreClient.UpdateChatState(ctx, chatID, "", "")
+			return
+		}
+
+		interactive := chatConfig.InteractiveInterval
+		standard := chatConfig.StandardInterval
+
+		if settingType == "interactive" {
+			interactive = val
+		} else if settingType == "standard" {
+			standard = val
+		}
+
+		if err := firestoreClient.UpdateIntervals(ctx, chatID, interactive, standard); err != nil {
+			telegramClient.SendMessage(chatID, "Failed to update settings.")
+			return
+		}
+
+		firestoreClient.UpdateChatState(ctx, chatID, "", "")
+		telegramClient.SendMessage(chatID, fmt.Sprintf("✅ Settings updated!\nInteractive: %ds\nStandard: %dm", interactive, standard))
+		return
+	}
+
 	if err != nil || chatConfig.CurrentSession == "" {
 		telegramClient.SendMessage(chatID, "No active session. Use /tasks to select one or /new_chat to create one.")
 		return
@@ -642,5 +733,35 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 		log.Printf("Failed to send message to Jules: %v", err)
 		telegramClient.SendMessage(chatID, "Failed to send message to Jules.")
 		return
+	}
+
+	firestoreClient.UpdateIsWaitingForJules(ctx, chatID, true)
+	triggerPoller()
+}
+
+func triggerPoller() {
+	// Trigger the poller with a short timeout.
+	// We want to start the Cloud Function execution without waiting for its 55-minute loop to finish.
+	pollerURL := os.Getenv("POLLER_URL")
+	if pollerURL == "" {
+		log.Println("POLLER_URL is not set, cannot trigger poller")
+		return
+	}
+
+	ctx := context.Background()
+	client, err := idtoken.NewClient(ctx, pollerURL)
+	if err != nil {
+		log.Printf("Failed to create authenticated client for poller: %v", err)
+		return
+	}
+
+	// Set a very short timeout so we drop the connection quickly, letting the webhook respond,
+	// but the HTTP request will have already triggered the poller execution.
+	client.Timeout = 100 * time.Millisecond
+
+	// This will most likely return a context deadline exceeded error, which is expected.
+	resp, err := client.Get(pollerURL)
+	if err == nil {
+		defer resp.Body.Close()
 	}
 }

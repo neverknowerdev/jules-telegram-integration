@@ -11,6 +11,8 @@ This repository contains the code and setup scripts to integrate Jules (Google's
     - `/status`: View the status of the currently bound session.
     - `/switch <session_id>`: Switch the active session for the current chat.
 - **Multi-User/Chat Support**: Supports multiple Telegram chats, each bound to a specific Jules source/repository.
+- **Interactive Polling Mode**: When Jules is processing a task, the bot switches to an "Interactive Mode", checking for updates every few seconds instead of every 5 minutes.
+- **Settings & Refresh Buttons**: Configure standard and interactive intervals directly from Telegram, and manually refresh active tasks.
 
 ## Prerequisites
 
@@ -50,8 +52,8 @@ If you prefer to deploy manually without running the setup script:
 ## Architecture
 
 - **Webhook Function**: A Cloud Function that receives updates from Telegram and handles user commands.
-- **Poller Function**: A Cloud Function triggered by Cloud Scheduler (default every 5 mins) to check for new Jules activities.
-- **Firestore**: Used to store the mapping between Telegram Chat IDs and Jules Sessions/Sources, and to track the last seen activity.
+- **Poller Function**: A Cloud Function triggered by Cloud Scheduler (default every 5 mins) to check for new Jules activities. It also runs in a long-running loop (up to 1 hour) when "Interactive Mode" is active to provide real-time updates.
+- **Firestore**: Used to store the mapping between Telegram Chat IDs and Jules Sessions/Sources, track the last seen activity, and manage polling configurations.
 
 ## Development
 

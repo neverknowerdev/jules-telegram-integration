@@ -120,34 +120,14 @@ echo ""
 echo "Setting up Firestore..."
 gcloud firestore databases create --location=us-central1 --type=firestore-native --quiet || true
 
-# 8. Deploy Webhook Function
+# We deploy Poller first so Webhook can get the POLLER_URL for asynchronous triggering.
+
+# 8. Deploy Poller Function
 echo ""
-echo "Deploying Webhook Function (this may take a few minutes)..."
+echo "Deploying Poller Function..."
 
 ENV_VARS="^@^JULES_API_KEY=$API_KEY@TELEGRAM_TOKEN=$TELEGRAM_TOKEN@SELECTED_SOURCES=$SELECTED_SOURCES@GCP_PROJECT=$PROJECT_ID"
 
-gcloud functions deploy jules-telegram-webhook \
-    --gen2 \
-    --region=us-central1 \
-    --runtime=go121 \
-    --source=. \
-    --entry-point=TelegramWebhook \
-    --trigger-http \
-    --allow-unauthenticated \
-    --set-env-vars="$ENV_VARS" \
-    --quiet
-
-# Get Webhook URL
-WEBHOOK_URL=$(gcloud functions describe jules-telegram-webhook --gen2 --region=us-central1 --format="value(serviceConfig.uri)")
-echo "Webhook Deployed at: $WEBHOOK_URL"
-
-# Set Telegram Webhook
-echo "Setting Telegram Webhook..."
-curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/setWebhook" -d "url=$WEBHOOK_URL" > /dev/null
-
-# 9. Deploy Poller Function
-echo ""
-echo "Deploying Poller Function..."
 gcloud functions deploy jules-poller \
     --gen2 \
     --region=us-central1 \
@@ -156,6 +136,7 @@ gcloud functions deploy jules-poller \
     --entry-point=JulesPoller \
     --trigger-http \
     --no-allow-unauthenticated \
+    --timeout=3600 \
     --set-env-vars="$ENV_VARS" \
     --quiet
 
@@ -174,6 +155,31 @@ gcloud functions add-invoker-policy-binding jules-poller \
     --region=us-central1 \
     --member="serviceAccount:$SA_EMAIL" \
     --quiet
+
+# 9. Deploy Webhook Function
+echo ""
+echo "Deploying Webhook Function (this may take a few minutes)..."
+
+WEBHOOK_ENV_VARS="${ENV_VARS}@POLLER_URL=${POLLER_URL}"
+
+gcloud functions deploy jules-telegram-webhook \
+    --gen2 \
+    --region=us-central1 \
+    --runtime=go121 \
+    --source=. \
+    --entry-point=TelegramWebhook \
+    --trigger-http \
+    --allow-unauthenticated \
+    --set-env-vars="$WEBHOOK_ENV_VARS" \
+    --quiet
+
+# Get Webhook URL
+WEBHOOK_URL=$(gcloud functions describe jules-telegram-webhook --gen2 --region=us-central1 --format="value(serviceConfig.uri)")
+echo "Webhook Deployed at: $WEBHOOK_URL"
+
+# Set Telegram Webhook
+echo "Setting Telegram Webhook..."
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/setWebhook" -d "url=$WEBHOOK_URL" > /dev/null
 
 # 10. Create Scheduler Job
 echo ""
