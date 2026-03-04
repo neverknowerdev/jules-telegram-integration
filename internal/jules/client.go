@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 var BaseURL = "https://jules.googleapis.com/v1alpha"
@@ -266,18 +267,23 @@ func (c *Client) CreateSession(prompt, source, mode string) (*Session, error) {
 		reqBody.SourceContext = map[string]interface{}{
 			"source": source,
 		}
+		if strings.Contains(source, "github") {
+			reqBody.SourceContext["githubRepoContext"] = map[string]interface{}{
+				"startingBranch": "main",
+			}
+		}
 	}
+
+	// Jules always creates a PR by default for this integration.
+	reqBody.AutomationMode = "AUTO_CREATE_PR"
 
 	if mode == "interactive" {
 		b := true
 		reqBody.RequirePlanApproval = &b
-	} else if mode == "start" || mode == "scheduled" {
+	} else {
+		// start, scheduled, review all default to auto-approved plans.
 		b := false
 		reqBody.RequirePlanApproval = &b
-	} else if mode == "review" {
-		b := false
-		reqBody.RequirePlanApproval = &b
-		reqBody.AutomationMode = "AUTO_CREATE_PR"
 	}
 
 	body, err := json.Marshal(reqBody)
