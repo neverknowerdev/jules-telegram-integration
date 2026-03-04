@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 )
 
@@ -55,7 +57,8 @@ type Chat struct {
 // InlineKeyboard types
 type InlineKeyboardButton struct {
 	Text         string `json:"text"`
-	CallbackData string `json:"callback_data"`
+	CallbackData string `json:"callback_data,omitempty"`
+	URL          string `json:"url,omitempty"`
 }
 
 type InlineKeyboardMarkup struct {
@@ -93,10 +96,48 @@ func (c *Client) SendMessage(chatID int64, text string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] SendMessage error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil
+}
+
+// SendMessageReturningID sends a message and returns the Telegram message_id.
+func (c *Client) SendMessageReturningID(chatID int64, text string) (int, error) {
+	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "HTML",
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[TELEGRAM] SendMessageReturningID error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return 0, fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return 0, err
+	}
+	return result.Result.MessageID, nil
 }
 
 func (c *Client) SendMessageWithKeyboard(chatID int64, text string, keyboard InlineKeyboardMarkup) error {
@@ -119,7 +160,9 @@ func (c *Client) SendMessageWithKeyboard(chatID int64, text string, keyboard Inl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] SendMessageWithKeyboard error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil

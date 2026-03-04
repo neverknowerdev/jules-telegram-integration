@@ -9,13 +9,17 @@ import (
 )
 
 type ChatConfig struct {
-	ChatID         int64  `firestore:"chat_id"`
-	Source         string `firestore:"source"`
-	CurrentSession string `firestore:"current_session"`
-	LastActivityID string `firestore:"last_activity_id"`
-	State          string `firestore:"state"`
-	DraftSource    string `firestore:"draft_source"`
-	CreationMode   string `firestore:"creation_mode"`
+	ChatID            int64           `firestore:"chat_id"`
+	Source            string          `firestore:"source"`
+	CurrentSession    string          `firestore:"current_session"`
+	LastActivityID    string          `firestore:"last_activity_id"`
+	State             string          `firestore:"state"`
+	DraftSource       string          `firestore:"draft_source"`
+	CreationMode      string          `firestore:"creation_mode"`
+	ProgressMessageID int             `firestore:"progress_message_id"`
+	CompletionSent    bool            `firestore:"completion_sent"`
+	NotifiedPRs       map[string]bool `firestore:"notified_prs"`
+	NotifiedBranches  map[string]bool `firestore:"notified_branches"`
 }
 
 type Client struct {
@@ -76,6 +80,33 @@ func (c *Client) UpdateCreationMode(ctx context.Context, chatID int64, mode stri
 func (c *Client) UpdateLastActivity(ctx context.Context, chatID int64, activityID string) error {
 	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
 		{Path: "last_activity_id", Value: activityID},
+	})
+	return err
+}
+
+func (c *Client) UpdateProgressMessageID(ctx context.Context, chatID int64, messageID int) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{Path: "progress_message_id", Value: messageID},
+	})
+	return err
+}
+
+func (c *Client) SetCompletionSent(ctx context.Context, chatID int64, sent bool) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{Path: "completion_sent", Value: sent},
+	})
+	return err
+}
+func (c *Client) MarkPRAsNotified(ctx context.Context, chatID int64, prURL string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{FieldPath: firestore.FieldPath{"notified_prs", prURL}, Value: true},
+	})
+	return err
+}
+
+func (c *Client) MarkBranchAsNotified(ctx context.Context, chatID int64, branchName string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{FieldPath: firestore.FieldPath{"notified_branches", branchName}, Value: true},
 	})
 	return err
 }

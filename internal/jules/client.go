@@ -82,12 +82,29 @@ func (c *Client) ListSources() ([]Source, error) {
 	return allSources, nil
 }
 
+type SessionOutput struct {
+	PullRequest *struct {
+		URL     string `json:"url"`
+		Title   string `json:"title"`
+		HeadRef string `json:"headRef"`
+		BaseRef string `json:"baseRef"`
+	} `json:"pullRequest,omitempty"`
+	ChangeSet *struct {
+		Source   string `json:"source"`
+		GitPatch struct {
+			SuggestedCommitMessage string `json:"suggestedCommitMessage"`
+		} `json:"gitPatch"`
+	} `json:"changeSet,omitempty"`
+}
+
 type Session struct {
-	Name          string `json:"name"`
-	Id            string `json:"id"`
-	Title         string `json:"title"`
-	UpdateTime    string `json:"updateTime"`
-	State         string `json:"state"`
+	Name          string          `json:"name"`
+	Id            string          `json:"id"`
+	Title         string          `json:"title"`
+	UpdateTime    string          `json:"updateTime"`
+	State         string          `json:"state"`
+	URL           string          `json:"url"`
+	Outputs       []SessionOutput `json:"outputs,omitempty"`
 	SourceContext struct {
 		Source string `json:"source"`
 	} `json:"sourceContext"`
@@ -141,6 +158,34 @@ func (c *Client) ListSessions() ([]Session, error) {
 	return allSessions, nil
 }
 
+func (c *Client) GetSession(sessionName string) (*Session, error) {
+	if !strings.HasPrefix(sessionName, "sessions/") {
+		sessionName = "sessions/" + sessionName
+	}
+	req, err := http.NewRequest("GET", BaseURL+"/"+sessionName, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Jules API error: %s", string(body))
+	}
+
+	var session Session
+	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
 type Activity struct {
 	Name            string `json:"name"`
 	Id              string `json:"id"`
@@ -152,7 +197,12 @@ type Activity struct {
 	} `json:"progressUpdated,omitempty"`
 	PlanGenerated struct {
 		Plan struct {
+			Id    string `json:"id"`
 			Title string `json:"title"`
+			Steps []struct {
+				Title       string `json:"title"`
+				Description string `json:"description"`
+			} `json:"steps"`
 		} `json:"plan"`
 	} `json:"planGenerated,omitempty"`
 	AgentMessaged struct {
@@ -161,6 +211,15 @@ type Activity struct {
 	UserMessaged struct {
 		UserMessage string `json:"userMessage"`
 	} `json:"userMessaged,omitempty"`
+	SessionCompleted *struct{} `json:"sessionCompleted,omitempty"`
+	SessionFailed    *struct {
+		Reason string `json:"reason"`
+	} `json:"sessionFailed,omitempty"`
+	Artifacts []struct {
+		ChangeSet struct {
+			Source string `json:"source"`
+		} `json:"changeSet"`
+	} `json:"artifacts,omitempty"`
 }
 
 type ListActivitiesResponse struct {

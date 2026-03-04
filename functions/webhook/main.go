@@ -433,6 +433,42 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, "✅ Plan approved successfully!")
+			// Reset completion_sent flag for this session
+			firestoreClient.SetCompletionSent(ctx, chatID, false)
+		}
+		return
+	}
+
+	// Handle Create PR callback
+	if strings.HasPrefix(data, "create_pr:") {
+		sessionIDShort := strings.TrimPrefix(data, "create_pr:")
+		sessionName := "sessions/" + sessionIDShort
+
+		telegramClient.AnswerCallbackQuery(callbackID, "Sending 'Create PR' to Jules...")
+		if err := julesClient.SendMessage(sessionName, "Create PR"); err != nil {
+			log.Printf("Failed to send PR request to Jules: %v", err)
+			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
+		} else {
+			telegramClient.SendMessage(chatID, "🚀 Sent 'Create PR' command to Jules. Working...")
+			// Reset flags to pick up new progress
+			firestoreClient.SetCompletionSent(ctx, chatID, false)
+		}
+		return
+	}
+
+	// Handle Create Branch callback
+	if strings.HasPrefix(data, "create_branch:") {
+		sessionIDShort := strings.TrimPrefix(data, "create_branch:")
+		sessionName := "sessions/" + sessionIDShort
+
+		telegramClient.AnswerCallbackQuery(callbackID, "Sending 'Create Branch' to Jules...")
+		if err := julesClient.SendMessage(sessionName, "Create Branch"); err != nil {
+			log.Printf("Failed to send Branch request to Jules: %v", err)
+			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
+		} else {
+			telegramClient.SendMessage(chatID, "🚀 Sent 'Create Branch' command to Jules. Working...")
+			// Reset flags to pick up new progress
+			firestoreClient.SetCompletionSent(ctx, chatID, false)
 		}
 		return
 	}
@@ -514,9 +550,22 @@ func formatActivity(act jules.Activity) string {
 	if act.ProgressUpdated.Title != "" {
 		title = act.ProgressUpdated.Title
 		desc = act.ProgressUpdated.Description
-	} else if act.PlanGenerated.Plan.Title != "" {
+	} else if len(act.PlanGenerated.Plan.Steps) > 0 {
 		title = "Plan Generated"
-		desc = act.PlanGenerated.Plan.Title
+		desc = formatTelegramHTML(act.PlanGenerated.Plan.Title)
+		if desc != "" {
+			desc += "\n\n"
+		}
+		for i, step := range act.PlanGenerated.Plan.Steps {
+			stepTitle := formatTelegramHTML(step.Title)
+			desc += fmt.Sprintf("<b>%d. %s</b>\n", i+1, stepTitle)
+			if step.Description != "" {
+				cleanDesc := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(step.Description), "-"))
+				desc += fmt.Sprintf("<i>%s</i>\n", formatTelegramHTML(cleanDesc))
+			}
+			desc += "\n"
+		}
+		desc = strings.TrimSpace(desc)
 	} else if act.Originator == "user" {
 		title = "You"
 		if act.UserMessaged.UserMessage != "" {
