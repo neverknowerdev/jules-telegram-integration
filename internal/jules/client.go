@@ -85,6 +85,8 @@ type Session struct {
 	Name          string `json:"name"`
 	Id            string `json:"id"`
 	Title         string `json:"title"`
+	UpdateTime    string `json:"updateTime"`
+	State         string `json:"state"`
 	SourceContext struct {
 		Source string `json:"source"`
 	} `json:"sourceContext"`
@@ -152,6 +154,12 @@ type Activity struct {
 			Title string `json:"title"`
 		} `json:"plan"`
 	} `json:"planGenerated,omitempty"`
+	AgentMessaged struct {
+		AgentMessage string `json:"agentMessage"`
+	} `json:"agentMessaged,omitempty"`
+	UserMessaged struct {
+		UserMessage string `json:"userMessage"`
+	} `json:"userMessaged,omitempty"`
 }
 
 type ListActivitiesResponse struct {
@@ -226,6 +234,114 @@ func (c *Client) SendMessage(sessionName, message string) error {
 	}
 	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
 	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Jules API error: %s", string(respBody))
+	}
+
+	return nil
+}
+
+type CreateSessionRequest struct {
+	Prompt              string                 `json:"prompt"`
+	SourceContext       map[string]interface{} `json:"sourceContext,omitempty"`
+	RequirePlanApproval *bool                  `json:"requirePlanApproval,omitempty"`
+	AutomationMode      string                 `json:"automationMode,omitempty"`
+}
+
+func (c *Client) CreateSession(prompt, source, mode string) (*Session, error) {
+	endpoint := BaseURL + "/sessions"
+
+	reqBody := CreateSessionRequest{
+		Prompt: prompt,
+	}
+	if source != "" {
+		reqBody.SourceContext = map[string]interface{}{
+			"source": source,
+		}
+	}
+
+	if mode == "interactive" {
+		b := true
+		reqBody.RequirePlanApproval = &b
+	} else if mode == "start" || mode == "scheduled" {
+		b := false
+		reqBody.RequirePlanApproval = &b
+	} else if mode == "review" {
+		b := false
+		reqBody.RequirePlanApproval = &b
+		reqBody.AutomationMode = "AUTO_CREATE_PR"
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Jules API error: %s", string(respBody))
+	}
+
+	var session Session
+	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+		return nil, err
+	}
+
+	return &session, nil
+}
+
+func (c *Client) ArchiveSession(sessionName string) error {
+	endpoint := fmt.Sprintf("%s/%s:archive", BaseURL, sessionName)
+
+	req, err := http.NewRequest("POST", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Jules API error: %s", string(respBody))
+	}
+
+	return nil
+}
+
+func (c *Client) ApprovePlan(sessionName string) error {
+	endpoint := fmt.Sprintf("%s/%s:approvePlan", BaseURL, sessionName)
+
+	req, err := http.NewRequest("POST", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

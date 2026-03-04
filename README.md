@@ -23,12 +23,16 @@ This repository contains the code and setup scripts to integrate Jules (Google's
 
 ### Automated Setup (Recommended)
 
-We provide a setup tool that automates the entire deployment process.
+We provide a bash setup script that automates the entire deployment process.
 
-1.  **Download the latest release** for your OS (or build from source).
-2.  **Run the setup tool**:
+1.  **Clone the repository**:
     ```bash
-    ./jules-setup
+    git clone https://github.com/your-repo/jules-telegram-bot.git
+    cd jules-telegram-bot
+    ```
+2.  **Run the setup script**:
+    ```bash
+    ./scripts/install.sh
     ```
 3.  **Follow the interactive prompts**:
     - The tool will check your `gcloud` authentication.
@@ -36,23 +40,12 @@ We provide a setup tool that automates the entire deployment process.
     - It will help you select a Jules Source (Repository) to bind.
     - It will deploy the necessary Cloud Functions and Cloud Scheduler jobs to your GCP project.
 
-### Manual Build & Deploy
+### Manual Deploy
 
-If you prefer to build from source or deploy manually:
+If you prefer to deploy manually without running the setup script:
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/your-repo/jules-telegram-bot.git
-    cd jules-telegram-bot
-    ```
-
-2.  **Build the Setup Tool**:
-    ```bash
-    go build -o jules-setup cmd/setup/main.go
-    ```
-
-3.  **Deploy Cloud Functions**:
-    (Refer to the `cmd/setup/main.go` logic for the exact `gcloud functions deploy` commands used).
+1.  **Deploy Cloud Functions**:
+    (Refer to the `scripts/install.sh` logic for the exact `gcloud functions deploy` commands used).
 
 ## Architecture
 

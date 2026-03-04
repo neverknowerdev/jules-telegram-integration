@@ -13,6 +13,9 @@ type ChatConfig struct {
 	Source         string `firestore:"source"`
 	CurrentSession string `firestore:"current_session"`
 	LastActivityID string `firestore:"last_activity_id"`
+	State          string `firestore:"state"`
+	DraftSource    string `firestore:"draft_source"`
+	CreationMode   string `firestore:"creation_mode"`
 }
 
 type Client struct {
@@ -51,6 +54,21 @@ func (c *Client) GetChatConfig(ctx context.Context, chatID int64) (*ChatConfig, 
 func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, sessionID string) error {
 	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
 		{Path: "current_session", Value: sessionID},
+	})
+	return err
+}
+
+func (c *Client) UpdateChatState(ctx context.Context, chatID int64, state, draftSource string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{Path: "state", Value: state},
+		{Path: "draft_source", Value: draftSource},
+	})
+	return err
+}
+
+func (c *Client) UpdateCreationMode(ctx context.Context, chatID int64, mode string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{Path: "creation_mode", Value: mode},
 	})
 	return err
 }

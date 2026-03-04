@@ -1,4 +1,4 @@
-package main
+package poller
 
 import (
 	"context"
@@ -6,12 +6,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 
-	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
-	"github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
-	"jules-telegram-bot/internal/firestore"
-	"jules-telegram-bot/internal/jules"
-	"jules-telegram-bot/internal/telegram"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
 )
 
 var (
@@ -20,17 +20,6 @@ var (
 	telegramClient  *telegram.Client
 	projectID       string
 )
-
-func init() {
-	functions.HTTP("JulesPoller", JulesPoller)
-}
-
-func main() {
-	initEnv()
-	if err := funcframework.Start("8080"); err != nil {
-		log.Fatalf("Function start error: %v", err)
-	}
-}
 
 func initEnv() {
 	projectID = os.Getenv("GCP_PROJECT")
@@ -140,7 +129,19 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		for _, act := range newActivities {
 			msg := formatActivity(act)
-			telegramClient.SendMessage(chat.ChatID, msg)
+			if act.PlanGenerated.Plan.Title != "" {
+				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+				keyboard := telegram.InlineKeyboardMarkup{
+					InlineKeyboard: [][]telegram.InlineKeyboardButton{
+						{
+							{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort},
+						},
+					},
+				}
+				telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
+			} else {
+				telegramClient.SendMessage(chat.ChatID, msg)
+			}
 		}
 
 		// Update LastActivityID to the newest one processed
@@ -161,7 +162,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 func formatActivity(act jules.Activity) string {
 	title := "New Activity"
 	desc := ""
-
 	if act.ProgressUpdated.Title != "" {
 		title = act.ProgressUpdated.Title
 		desc = act.ProgressUpdated.Description
@@ -169,12 +169,50 @@ func formatActivity(act jules.Activity) string {
 		title = "Plan Generated"
 		desc = act.PlanGenerated.Plan.Title
 	} else if act.Originator == "user" {
-		title = "User Message"
-		// We might want to skip user messages if we sent them?
-		// But seeing them confirms receipt.
+		title = "You"
+		if act.UserMessaged.UserMessage != "" {
+			desc = formatTelegramHTML(act.UserMessaged.UserMessage)
+		}
 	} else if act.Originator == "agent" {
-		title = "Agent Message"
+		title = "Jules"
+		if act.AgentMessaged.AgentMessage != "" {
+			desc = formatTelegramHTML(act.AgentMessaged.AgentMessage)
+		}
 	}
 
-	return fmt.Sprintf("*%s*\n%s", title, desc)
+	// Escape HTML for title safely
+	title = strings.ReplaceAll(title, "&", "&amp;")
+	title = strings.ReplaceAll(title, "<", "&lt;")
+	title = strings.ReplaceAll(title, ">", "&gt;")
+
+	if desc != "" {
+		return fmt.Sprintf("🤖 <b>%s</b>\n%s", title, desc)
+	}
+	return fmt.Sprintf("🤖 <b>%s</b>", title)
+}
+
+func formatTelegramHTML(md string) string {
+	// First escape <, >, & so they don't break HTML parsing
+	md = strings.ReplaceAll(md, "&", "&amp;")
+	md = strings.ReplaceAll(md, "<", "&lt;")
+	md = strings.ReplaceAll(md, ">", "&gt;")
+
+	// Markdown to HTML conversions
+	// **bold**
+	reBold := regexp.MustCompile(`(?s)\*\*(.*?)\*\*`)
+	md = reBold.ReplaceAllString(md, "<b>$1</b>")
+
+	// *italic*
+	reItalic := regexp.MustCompile(`(?s)\*(.*?)\*`)
+	md = reItalic.ReplaceAllString(md, "<i>$1</i>")
+
+	// ```code block```
+	reCodeBlock := regexp.MustCompile("(?s)```(.*?)```")
+	md = reCodeBlock.ReplaceAllString(md, "<pre>$1</pre>")
+
+	// `inline code`
+	reInline := regexp.MustCompile("(?s)`(.*?)`")
+	md = reInline.ReplaceAllString(md, "<code>$1</code>")
+
+	return md
 }
