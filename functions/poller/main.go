@@ -12,12 +12,14 @@ import (
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/telegraph"
 )
 
 var (
 	julesClient     jules.ClientInterface
 	firestoreClient firestore.ClientInterface
 	telegramClient  telegram.ClientInterface
+	telegraphClient *telegraph.Client
 	projectID       string
 )
 
@@ -36,6 +38,40 @@ func initEnv() {
 	if telegramToken != "" {
 		telegramClient = telegram.NewClient(telegramToken)
 	}
+
+	telegraphToken := os.Getenv("TELEGRAPH_ACCESS_TOKEN")
+	if telegraphToken != "" {
+		telegraphClient = telegraph.NewClient(telegraphToken)
+	}
+}
+
+func buildTelegraphContent(lines []string) []telegraph.Node {
+	var nodes []telegraph.Node
+	for _, line := range lines {
+		// Clean up HTML tags from line
+		line = strings.ReplaceAll(line, "<b>", "")
+		line = strings.ReplaceAll(line, "</b>", "")
+		line = strings.ReplaceAll(line, "<i>", "")
+		line = strings.ReplaceAll(line, "</i>", "")
+		line = strings.ReplaceAll(line, "<pre>", "")
+		line = strings.ReplaceAll(line, "</pre>", "")
+		line = strings.ReplaceAll(line, "<code>", "")
+		line = strings.ReplaceAll(line, "</code>", "")
+		line = strings.ReplaceAll(line, "<blockquote expandable>", "")
+		line = strings.ReplaceAll(line, "</blockquote>", "")
+
+		nodes = append(nodes, telegraph.Node{
+			Tag:      "p",
+			Children: []telegraph.NodeChild{line},
+		})
+	}
+	if len(nodes) == 0 {
+		nodes = append(nodes, telegraph.Node{
+			Tag:      "p",
+			Children: []telegraph.NodeChild{"No logs available yet."},
+		})
+	}
+	return nodes
 }
 
 func JulesPoller(w http.ResponseWriter, r *http.Request) {
@@ -220,9 +256,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		// Rebuild and update the progress message if needed
 		if hasNewProgress {
-			// Find the boundary of the current work round in ALL fetched activities (which might include old ones due to ListActivities padding)
-			// Actually `activities` only contains NEW activities since `chat.LastActivityID`, unless it's a cold start.
-			// Let's just render all progress updates in `activities`.
 			var allProgressLines []string
 			for _, act := range activities {
 				if act.Originator == "user" {
@@ -260,19 +293,48 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			if len(allProgressLines) > 0 || progressMsgID == 0 {
 				header := "⚙️ <b>Jules is working on it...</b>\n\n"
 
-				// Instead of an arbitrary 15 item limit, we pack as many as we can fit within ~4000 characters
-				// We iterate backwards (newest to oldest) so we always show the newest.
+				// Sync to Telegraph
+				var telegraphURL string
+				if telegraphClient != nil && telegraphClient.AccessToken != "" {
+					pageContent := buildTelegraphContent(allProgressLines)
+					pageTitle := "Jules Task Logs"
+
+					var currentTelegraphPath string
+					if len(chat.TelegraphPages) > 0 {
+						currentTelegraphPath = chat.TelegraphPages[len(chat.TelegraphPages)-1]
+					}
+
+					if currentTelegraphPath == "" {
+						pageResp, err := telegraphClient.CreatePage(pageTitle, pageContent)
+						if err == nil {
+							telegraphURL = pageResp.Result.URL
+							chat.TelegraphPages = append(chat.TelegraphPages, pageResp.Result.Path)
+							firestoreClient.AppendTelegraphPage(ctx, chat.ChatID, chat.ThreadID, pageResp.Result.Path)
+						} else {
+							log.Printf("[POLLER] Telegraph CreatePage failed: %v", err)
+						}
+					} else {
+						pageResp, err := telegraphClient.EditPage(currentTelegraphPath, pageTitle, pageContent)
+						if err == nil {
+							telegraphURL = pageResp.Result.URL
+						} else {
+							log.Printf("[POLLER] Telegraph EditPage failed: %v", err)
+						}
+					}
+				}
+
+				// Pack as many as we can fit within ~4000 characters
 				var finalLines []string
 				currentLen := len(header)
+				omittedCount := 0
 
 				for i := len(allProgressLines) - 1; i >= 0; i-- {
 					lineLen := len(allProgressLines[i]) + 2 // +2 for the \n\n
-					if currentLen + lineLen > 4000 {
-						// Add a truncation indicator at the top if we had to cut lines
-						finalLines = append([]string{"<i>...older steps omitted...</i>"}, finalLines...)
+					if currentLen+lineLen > 4000 {
+						omittedCount = i + 1
+						finalLines = append([]string{fmt.Sprintf("<i>...%d older steps omitted...</i>", omittedCount)}, finalLines...)
 						break
 					}
-					// Prepend to final lines to maintain chronological order
 					finalLines = append([]string{allProgressLines[i]}, finalLines...)
 					currentLen += lineLen
 				}
@@ -285,20 +347,43 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					msg = header + body
 				}
 
+				var keyboard *telegram.InlineKeyboardMarkup
+				if telegraphURL != "" {
+					keyboard = &telegram.InlineKeyboardMarkup{
+						InlineKeyboard: [][]telegram.InlineKeyboardButton{
+							{{Text: "🔗 Full log", URL: telegraphURL}},
+						},
+					}
+				}
+
 				if progressMsgID == 0 {
-					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
+					var err error
+					var msgID int
+					if keyboard != nil {
+						msgID, err = telegramClient.SendMessageWithKeyboardReturningID(chat.ChatID, chat.ThreadID, msg, *keyboard)
+					} else {
+						msgID, err = telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg)
+					}
+
+					if err == nil {
 						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, msgID)
 						chat.ProgressMessageID = msgID
 					} else {
 						log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create progress message: %v", chat.ChatID, chat.ThreadID, err)
 					}
 				} else {
-					// Telegram natively shows an "edited" label with time when the text actually changes.
-					// Since we only edit when there's new progress, the text will differ naturally.
-					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
-						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, err)
-						// If edit fails (e.g., message deleted), try sending a new one
-						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
+					editErr := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, keyboard)
+					if editErr != nil {
+						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, editErr)
+						var msgID int
+						var err error
+						if keyboard != nil {
+							msgID, err = telegramClient.SendMessageWithKeyboardReturningID(chat.ChatID, chat.ThreadID, msg, *keyboard)
+						} else {
+							msgID, err = telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg)
+						}
+
+						if err == nil {
 							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, msgID)
 							chat.ProgressMessageID = msgID
 						} else {

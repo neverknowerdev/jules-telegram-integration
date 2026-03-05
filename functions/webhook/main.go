@@ -14,12 +14,14 @@ import (
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/telegraph"
 )
 
 var (
 	julesClient     jules.ClientInterface
 	firestoreClient firestore.ClientInterface
 	telegramClient  telegram.ClientInterface
+	telegraphClient *telegraph.Client
 	projectID       string
 	selectedSources []string
 )
@@ -42,6 +44,11 @@ func initEnv() {
 	}
 	if telegramToken != "" {
 		telegramClient = telegram.NewClient(telegramToken)
+	}
+
+	telegraphToken := os.Getenv("TELEGRAPH_ACCESS_TOKEN")
+	if telegraphToken != "" {
+		telegraphClient = telegraph.NewClient(telegraphToken)
 	}
 }
 
@@ -105,6 +112,12 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if update.Message.ForumTopicClosed != nil {
+		handleTopicClosed(ctx, chatID, threadID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if !strings.HasPrefix(text, "/") && text != "🗓 Show Tasks" && text != "➕ New Task" {
 		handleMessage(ctx, chatID, threadID, text)
 	} else {
@@ -112,6 +125,37 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func handleTopicClosed(ctx context.Context, chatID int64, threadID int) {
+	log.Printf("[WEBHOOK] Topic closed/deleted: thread_id %d", threadID)
+
+	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
+	if err == nil && chatConfig != nil {
+		if telegraphClient != nil && telegraphClient.AccessToken != "" {
+			for _, path := range chatConfig.TelegraphPages {
+				// clear the content of the telegraph page
+				_, err := telegraphClient.EditPage(path, "Deleted Task Logs", []telegraph.Node{
+					{
+						Tag:      "p",
+						Children: []telegraph.NodeChild{"Logs have been deleted as the task was archived/deleted."},
+					},
+				})
+				if err != nil {
+					log.Printf("[WEBHOOK] Failed to delete telegraph page %s: %v", path, err)
+				} else {
+					log.Printf("[WEBHOOK] Cleared telegraph page %s", path)
+				}
+			}
+		}
+
+		err = firestoreClient.DeleteChatConfig(ctx, chatID, threadID)
+		if err != nil {
+			log.Printf("[WEBHOOK] Error deleting chat config: %v", err)
+		} else {
+			log.Printf("[WEBHOOK] Deleted chat config for thread %d", threadID)
+		}
+	}
 }
 
 func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *telegram.ForumTopicCreated) {

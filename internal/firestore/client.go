@@ -21,6 +21,7 @@ type ChatConfig struct {
 	ProgressMessageID int             `firestore:"progress_message_id"`
 	NotifiedPRs       map[string]bool `firestore:"notified_prs"`
 	NotifiedBranches  map[string]bool `firestore:"notified_branches"`
+	TelegraphPages    []string        `firestore:"telegraph_pages"`
 }
 
 type Client struct {
@@ -102,6 +103,14 @@ func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, threadI
 		{Path: "state", Value: ""},
 		{Path: "notified_prs", Value: nil},
 		{Path: "notified_branches", Value: nil},
+	})
+	return err
+}
+
+func (c *Client) AppendTelegraphPage(ctx context.Context, chatID int64, threadID int, path string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
+		{Path: "telegraph_pages", Value: firestore.ArrayUnion(path)},
 	})
 	return err
 }

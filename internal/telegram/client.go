@@ -30,13 +30,14 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID         int                `json:"message_id"`
-	MessageThreadID   int                `json:"message_thread_id,omitempty"`
-	From              *User              `json:"from"`
-	Chat              *Chat              `json:"chat"`
-	IsTopicMessage    bool               `json:"is_topic_message,omitempty"`
-	ForumTopicCreated *ForumTopicCreated `json:"forum_topic_created,omitempty"`
-	Text              string             `json:"text"`
+	MessageID          int                `json:"message_id"`
+	MessageThreadID    int                `json:"message_thread_id,omitempty"`
+	From               *User              `json:"from"`
+	Chat               *Chat              `json:"chat"`
+	IsTopicMessage     bool               `json:"is_topic_message,omitempty"`
+	ForumTopicCreated  *ForumTopicCreated `json:"forum_topic_created,omitempty"`
+	ForumTopicClosed   *struct{}          `json:"forum_topic_closed,omitempty"`
+	Text               string             `json:"text"`
 }
 
 type CallbackQuery struct {
