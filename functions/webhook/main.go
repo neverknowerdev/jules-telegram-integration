@@ -94,6 +94,11 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 	text := update.Message.Text
 
 	if update.Message.ForumTopicCreated != nil {
+		// Ignore topics created by bots (e.g., our bot syncing history)
+		if update.Message.From != nil && update.Message.From.IsBot {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		handleTopicCreated(ctx, chatID, threadID, update.Message.ForumTopicCreated)
 		w.WriteHeader(http.StatusOK)
 		return
@@ -688,13 +693,8 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			log.Printf("Failed to fetch activities: %v", err)
 			telegramClient.SendMessage(chatID, newThreadID, "❌ Failed to fetch session history.")
 		} else {
-			// Reverse activities to chronological order
-			for i := 0; i < len(activities)/2; i++ {
-				j := len(activities) - i - 1
-				activities[i], activities[j] = activities[j], activities[i]
-			}
-
-			// Post history
+			// The Jules API returns activities in chronological order (oldest first).
+			// We iterate and post history.
 			for _, act := range activities {
 				if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
 					msg := fmt.Sprintf("👤 <b>User</b>\n%s", formatTelegramHTML(act.UserMessaged.UserMessage))
@@ -721,7 +721,24 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			}
 		}
 
-		telegramClient.SendMessage(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.")
+		topicKeyboard := telegram.ReplyKeyboardMarkup{
+			Keyboard: [][]telegram.KeyboardButton{
+				{
+					{Text: "🔄 Sync"},
+				},
+				{
+					{Text: "🗑 Remove Topic"},
+					{Text: "📦 Archive Task"},
+				},
+				{
+					{Text: "🏠 Main Menu"},
+				},
+			},
+			ResizeKeyboard: true,
+			IsPersistent:   true,
+		}
+
+		telegramClient.SendMessageWithReplyKeyboard(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.", topicKeyboard)
 
 		// Note: The inline keyboard from the `/tasks` command cannot be easily fully re-rendered without a ton of state,
 		// but the user can just re-send `/tasks` to see the updated link.
@@ -935,7 +952,7 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 
 	// Intercept Archive/Menu commands from keyboard
-	if text == "📦 Archive Chat" || text == "🏠 Main Menu" || text == "/archive" {
+	if text == "📦 Archive Chat" || text == "📦 Archive Task" || text == "🏠 Main Menu" || text == "/archive" || text == "🗑 Remove Topic" || text == "🔄 Sync" {
 		if text == "🏠 Main Menu" {
 			keyboard := telegram.ReplyKeyboardMarkup{
 				Keyboard: [][]telegram.KeyboardButton{
@@ -951,7 +968,24 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 			return
 		}
 
-		if text == "📦 Archive Chat" || text == "/archive" {
+		if text == "🔄 Sync" {
+			telegramClient.SendMessage(chatID, threadID, "⏳ Poller will sync updates shortly.")
+			// In a real implementation we could trigger a pubsub message to the poller here.
+			// For now, we just reply to give user feedback.
+			return
+		}
+
+		if text == "🗑 Remove Topic" {
+			if threadID > 0 {
+				telegramClient.DeleteForumTopic(chatID, threadID)
+				firestoreClient.DeleteChatConfig(ctx, chatID, threadID)
+			} else {
+				telegramClient.SendMessage(chatID, threadID, "This action is only available in topics.")
+			}
+			return
+		}
+
+		if text == "📦 Archive Chat" || text == "📦 Archive Task" || text == "/archive" {
 			if chatConfig == nil || chatConfig.CurrentSession == "" {
 				telegramClient.SendMessage(chatID, threadID, "No active session to archive.")
 				return
@@ -1010,7 +1044,23 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 		firestoreClient.UpdateChatState(ctx, chatID, threadID, "", "")
 
 		if threadID > 0 {
-			telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("✅ <b>New Chat Created!</b>\nSwitched session to: <code>%s</code>\n", strings.TrimPrefix(session.Name, "sessions/")))
+			topicKeyboard := telegram.ReplyKeyboardMarkup{
+				Keyboard: [][]telegram.KeyboardButton{
+					{
+						{Text: "🔄 Sync"},
+					},
+					{
+						{Text: "🗑 Remove Topic"},
+						{Text: "📦 Archive Task"},
+					},
+					{
+						{Text: "🏠 Main Menu"},
+					},
+				},
+				ResizeKeyboard: true,
+				IsPersistent:   true,
+			}
+			telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, fmt.Sprintf("✅ <b>New Chat Created!</b>\nSwitched session to: <code>%s</code>\n", strings.TrimPrefix(session.Name, "sessions/")), topicKeyboard)
 		} else {
 			keyboard := telegram.ReplyKeyboardMarkup{
 				Keyboard: [][]telegram.KeyboardButton{
