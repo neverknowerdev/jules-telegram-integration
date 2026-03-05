@@ -704,10 +704,28 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 					telegramClient.SendMessage(chatID, newThreadID, msg)
 				} else if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
 					msg := formatPlan(act)
-					telegramClient.SendMessage(chatID, newThreadID, msg)
+
+					sessionIDShort := strings.TrimPrefix(session.Name, "sessions/")
+					keyboard := telegram.InlineKeyboardMarkup{
+						InlineKeyboard: [][]telegram.InlineKeyboardButton{
+							{{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort}},
+						},
+					}
+					telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msg, keyboard)
 				} else if act.SessionCompleted != nil {
 					msg := formatCompletionMessage(session)
-					telegramClient.SendMessage(chatID, newThreadID, msg)
+
+					sessionIDShort := strings.TrimPrefix(session.Name, "sessions/")
+					keyboard := telegram.InlineKeyboardMarkup{
+						InlineKeyboard: [][]telegram.InlineKeyboardButton{
+							{
+								{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+								{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+							},
+							{{Text: "🔗 Open in Jules", URL: session.URL}},
+						},
+					}
+					telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msg, keyboard)
 				} else if act.SessionFailed != nil {
 					reason := act.SessionFailed.Reason
 					var errMsg string
@@ -738,7 +756,21 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			IsPersistent:   true,
 		}
 
-		telegramClient.SendMessageWithReplyKeyboard(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.", topicKeyboard)
+		// Also send the initial user prompt if available
+		var userPrompt string
+		for _, act := range activities {
+			if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
+				userPrompt = act.UserMessaged.UserMessage
+				break
+			}
+		}
+
+		if userPrompt == "" {
+			telegramClient.SendMessageWithReplyKeyboard(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.", topicKeyboard)
+		} else {
+			// Do not send a separate summary message if we just replayed history, just append the keyboard to the last message or a short sync note
+			telegramClient.SendMessageWithReplyKeyboard(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.", topicKeyboard)
+		}
 
 		// Note: The inline keyboard from the `/tasks` command cannot be easily fully re-rendered without a ton of state,
 		// but the user can just re-send `/tasks` to see the updated link.
