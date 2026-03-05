@@ -30,14 +30,14 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID          int                `json:"message_id"`
-	MessageThreadID    int                `json:"message_thread_id,omitempty"`
-	From               *User              `json:"from"`
-	Chat               *Chat              `json:"chat"`
-	IsTopicMessage     bool               `json:"is_topic_message,omitempty"`
-	ForumTopicCreated  *ForumTopicCreated `json:"forum_topic_created,omitempty"`
-	ForumTopicClosed   *struct{}          `json:"forum_topic_closed,omitempty"`
-	Text               string             `json:"text"`
+	MessageID         int                `json:"message_id"`
+	MessageThreadID   int                `json:"message_thread_id,omitempty"`
+	From              *User              `json:"from"`
+	Chat              *Chat              `json:"chat"`
+	IsTopicMessage    bool               `json:"is_topic_message,omitempty"`
+	ForumTopicCreated *ForumTopicCreated `json:"forum_topic_created,omitempty"`
+	ForumTopicClosed  *struct{}          `json:"forum_topic_closed,omitempty"`
+	Text              string             `json:"text"`
 }
 
 type CallbackQuery struct {
@@ -309,7 +309,9 @@ func (c *Client) EditMessageText(chatID int64, messageID int, text string, keybo
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] editMessageText error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil
