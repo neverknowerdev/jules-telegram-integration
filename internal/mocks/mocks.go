@@ -119,6 +119,15 @@ func (m *MockTelegramClient) EditMessageText(chatID int64, messageID int, text s
 	return nil
 }
 
+func (m *MockFirestoreClient) AppendTelegraphPage(ctx context.Context, chatID int64, threadID int, path string) error {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
+		config.TelegraphPages = append(config.TelegraphPages, path)
+	}
+	m.Updates = append(m.Updates, "AppendTelegraphPage")
+	return nil
+}
+
 func (m *MockTelegramClient) SetWebhook(webhookURL string) error {
 	return nil
 }

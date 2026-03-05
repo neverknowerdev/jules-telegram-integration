@@ -10,6 +10,7 @@ type ClientInterface interface {
 	GetChatsByChatID(ctx context.Context, chatID int64) ([]ChatConfig, error)
 	DeleteChatConfig(ctx context.Context, chatID int64, threadID int) error
 	UpdateCurrentSession(ctx context.Context, chatID int64, threadID int, sessionID string) error
+	AppendTelegraphPage(ctx context.Context, chatID int64, threadID int, path string) error
 	UpdateChatState(ctx context.Context, chatID int64, threadID int, state, draftSource string) error
 	UpdateDraftBranch(ctx context.Context, chatID int64, threadID int, draftBranch string) error
 	UpdateCreationMode(ctx context.Context, chatID int64, threadID int, mode string) error

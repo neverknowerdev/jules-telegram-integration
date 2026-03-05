@@ -14,12 +14,14 @@ import (
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/telegraph"
 )
 
 var (
 	julesClient     jules.ClientInterface
 	firestoreClient firestore.ClientInterface
 	telegramClient  telegram.ClientInterface
+	telegraphClient *telegraph.Client
 	projectID       string
 	selectedSources []string
 )
@@ -42,6 +44,11 @@ func initEnv() {
 	}
 	if telegramToken != "" {
 		telegramClient = telegram.NewClient(telegramToken)
+	}
+
+	telegraphToken := os.Getenv("TELEGRAPH_ACCESS_TOKEN")
+	if telegraphToken != "" {
+		telegraphClient = telegraph.NewClient(telegraphToken)
 	}
 }
 
@@ -105,6 +112,12 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if update.Message.ForumTopicClosed != nil {
+		handleTopicClosed(ctx, chatID, threadID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if !strings.HasPrefix(text, "/") && text != "🗓 Show Tasks" && text != "➕ New Task" {
 		handleMessage(ctx, chatID, threadID, text)
 	} else {
@@ -112,6 +125,37 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func handleTopicClosed(ctx context.Context, chatID int64, threadID int) {
+	log.Printf("[WEBHOOK] Topic closed/deleted: thread_id %d", threadID)
+
+	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
+	if err == nil && chatConfig != nil {
+		if telegraphClient != nil && telegraphClient.AccessToken != "" {
+			for _, path := range chatConfig.TelegraphPages {
+				// clear the content of the telegraph page
+				_, err := telegraphClient.EditPage(path, "Deleted Task Logs", []telegraph.Node{
+					{
+						Tag:      "p",
+						Children: []telegraph.NodeChild{"Logs have been deleted as the task was archived/deleted."},
+					},
+				})
+				if err != nil {
+					log.Printf("[WEBHOOK] Failed to delete telegraph page %s: %v", path, err)
+				} else {
+					log.Printf("[WEBHOOK] Cleared telegraph page %s", path)
+				}
+			}
+		}
+
+		err = firestoreClient.DeleteChatConfig(ctx, chatID, threadID)
+		if err != nil {
+			log.Printf("[WEBHOOK] Error deleting chat config: %v", err)
+		} else {
+			log.Printf("[WEBHOOK] Deleted chat config for thread %d", threadID)
+		}
+	}
 }
 
 func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *telegram.ForumTopicCreated) {
@@ -798,6 +842,8 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, targetThreadID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, targetThreadID, "✅ Plan approved successfully!")
+			// Reset progress message ID so a new log block starts after user input
+			firestoreClient.UpdateProgressMessageID(ctx, chatID, targetThreadID, 0)
 		}
 		return
 	}
@@ -1050,7 +1096,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 					}
 					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
 						{Text: "🔗 Open in Jules", URL: session.URL},
-						{Text: "👯 Clone Task", CallbackData: "clone:" + sessionIDShort},
 					})
 
 					keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
@@ -1072,6 +1117,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			Keyboard: [][]telegram.KeyboardButton{
 				{
 					{Text: "🔄 Sync"},
+					{Text: "👯 Clone Task"},
 					{Text: "📦 Archive Task"},
 				},
 			},
@@ -1307,7 +1353,7 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 
 	// Intercept Archive/Menu commands from keyboard
-	if text == "📦 Archive Chat" || text == "📦 Archive Task" || text == "🏠 Main Menu" || text == "/archive" || text == "🗑 Remove Topic" || text == "🔄 Sync" {
+	if text == "📦 Archive Chat" || text == "📦 Archive Task" || text == "🏠 Main Menu" || text == "/archive" || text == "🗑 Remove Topic" || text == "🔄 Sync" || text == "👯 Clone Task" {
 		if text == "🏠 Main Menu" {
 			keyboard := telegram.ReplyKeyboardMarkup{
 				Keyboard: [][]telegram.KeyboardButton{
@@ -1320,6 +1366,102 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 				IsPersistent:   true,
 			}
 			telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, "Main menu:", keyboard)
+			return
+		}
+
+		if text == "👯 Clone Task" {
+			if chatConfig == nil || chatConfig.CurrentSession == "" {
+				telegramClient.SendMessage(chatID, threadID, "No active session to clone.")
+				return
+			}
+
+			telegramClient.SendMessage(chatID, threadID, "Cloning task...")
+			session, err := julesClient.GetSession(chatConfig.CurrentSession)
+			if err != nil {
+				telegramClient.SendMessage(chatID, threadID, "❌ Failed to retrieve session for cloning.")
+				return
+			}
+
+			cleanTitle := strings.ReplaceAll(session.Title, "\n", " ")
+			runes := []rune(cleanTitle)
+			if len(runes) > 40 {
+				cleanTitle = string(runes[:37]) + "..."
+			}
+			newTitle := cleanTitle + " Cloned"
+
+			newThreadID, err := telegramClient.CreateForumTopic(chatID, newTitle)
+			if err != nil {
+				telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
+				return
+			}
+
+			// Pre-populate configs based on parent
+			draftSource := chatConfig.DraftSource
+			draftBranch := chatConfig.DraftBranch
+			if draftBranch == "" {
+				draftBranch = "main"
+			}
+
+			firestoreClient.SaveChatConfig(ctx, firestore.ChatConfig{
+				ChatID:      chatID,
+				ThreadID:    newThreadID,
+				DraftSource: draftSource,
+				DraftBranch: draftBranch,
+				State:       "waiting_for_title",
+			})
+
+			var branchButtons [][]telegram.InlineKeyboardButton
+			var currentRow []telegram.InlineKeyboardButton
+			idx := 1
+
+			// We need to fetch branches for the inherited source
+			var branches []string
+			sources, _ := julesClient.ListSources()
+			for _, s := range sources {
+				if s.Name == draftSource {
+					for _, b := range s.GithubRepo.Branches {
+						branches = append(branches, b.DisplayName)
+					}
+					break
+				}
+			}
+
+			if len(branches) == 0 {
+				branches = []string{"main"}
+			}
+
+			repoPart := draftSource
+			sourceParts := strings.Split(draftSource, "/")
+			if len(sourceParts) >= 2 {
+				repoPart = sourceParts[len(sourceParts)-1]
+			}
+
+			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", repoPart, draftBranch)
+
+			for _, branch := range branches {
+				btnText := fmt.Sprintf("%d", idx)
+				if branch == draftBranch {
+					btnText = "✅ " + btnText
+				}
+				btn := telegram.InlineKeyboardButton{
+					Text:         btnText,
+					CallbackData: fmt.Sprintf("topicbranch:%d:%s", newThreadID, branch),
+				}
+				currentRow = append(currentRow, btn)
+				msgBuilder += fmt.Sprintf("<b>%d</b> — <code>%s</code>\n", idx, branch)
+
+				if len(currentRow) == 5 {
+					branchButtons = append(branchButtons, currentRow)
+					currentRow = nil
+				}
+				idx++
+			}
+			if len(currentRow) > 0 {
+				branchButtons = append(branchButtons, currentRow)
+			}
+
+			topicKeyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
+			telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msgBuilder, topicKeyboard)
 			return
 		}
 
@@ -1419,6 +1561,7 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 				Keyboard: [][]telegram.KeyboardButton{
 					{
 						{Text: "🔄 Sync"},
+						{Text: "👯 Clone Task"},
 						{Text: "📦 Archive Task"},
 					},
 				},
@@ -1452,4 +1595,7 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 		telegramClient.SendMessage(chatID, threadID, "Failed to send message to Jules.")
 		return
 	}
+
+	// Reset progress message ID so a new log block starts after user input
+	firestoreClient.UpdateProgressMessageID(ctx, chatID, threadID, 0)
 }
