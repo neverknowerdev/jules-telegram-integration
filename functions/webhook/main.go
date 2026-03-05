@@ -433,8 +433,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, "✅ Plan approved successfully!")
-			// Reset completion_sent flag for this session
-			firestoreClient.SetCompletionSent(ctx, chatID, false)
 		}
 		return
 	}
@@ -450,8 +448,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, "🚀 Sent 'Create PR' command to Jules. Working...")
-			// Reset flags to pick up new progress
-			firestoreClient.SetCompletionSent(ctx, chatID, false)
 		}
 		return
 	}
@@ -467,8 +463,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
 		} else {
 			telegramClient.SendMessage(chatID, "🚀 Sent 'Create Branch' command to Jules. Working...")
-			// Reset flags to pick up new progress
-			firestoreClient.SetCompletionSent(ctx, chatID, false)
 		}
 		return
 	}

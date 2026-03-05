@@ -17,7 +17,6 @@ type ChatConfig struct {
 	DraftSource       string          `firestore:"draft_source"`
 	CreationMode      string          `firestore:"creation_mode"`
 	ProgressMessageID int             `firestore:"progress_message_id"`
-	CompletionSent    bool            `firestore:"completion_sent"`
 	NotifiedPRs       map[string]bool `firestore:"notified_prs"`
 	NotifiedBranches  map[string]bool `firestore:"notified_branches"`
 }
@@ -91,12 +90,6 @@ func (c *Client) UpdateProgressMessageID(ctx context.Context, chatID int64, mess
 	return err
 }
 
-func (c *Client) SetCompletionSent(ctx context.Context, chatID int64, sent bool) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
-		{Path: "completion_sent", Value: sent},
-	})
-	return err
-}
 func (c *Client) MarkPRAsNotified(ctx context.Context, chatID int64, prURL string) error {
 	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
 		{FieldPath: firestore.FieldPath{"notified_prs", prURL}, Value: true},

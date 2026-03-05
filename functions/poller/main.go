@@ -78,9 +78,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		if isTransitioningToActive {
 			log.Printf("[POLLER] Chat %d: session re-activated (%s -> %s), resetting tracking", chat.ChatID, chat.State, session.State)
 			firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, 0)
-			firestoreClient.SetCompletionSent(ctx, chat.ChatID, false)
 			chat.ProgressMessageID = 0
-			chat.CompletionSent = false
 		}
 
 		// Update tracked state in Firestore if changed
@@ -179,6 +177,36 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				if act.AgentMessaged.AgentMessage != "" {
 					msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
 					telegramClient.SendMessage(chat.ChatID, msg)
+					continue
+				}
+
+				// Session failed activity — send error notification immediately
+				if act.SessionFailed != nil {
+					reason := act.SessionFailed.Reason
+					var errMsg string
+					if reason != "" {
+						errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
+					} else {
+						errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
+					}
+					telegramClient.SendMessage(chat.ChatID, errMsg)
+					continue
+				}
+
+				// Session completed activity — send completion notification immediately
+				if act.SessionCompleted != nil {
+					msg := formatCompletionMessage(session)
+					sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+					keyboard := telegram.InlineKeyboardMarkup{
+						InlineKeyboard: [][]telegram.InlineKeyboardButton{
+							{
+								{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+								{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+							},
+							{{Text: "🔗 Open in Jules", URL: session.URL}},
+						},
+					}
+					telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
 					continue
 				}
 
@@ -291,29 +319,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 4. Completion/Failure Logic
-		if !chat.CompletionSent {
-			if session.State == "COMPLETED" {
-				msg := formatCompletionMessage(session)
-				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-				keyboard := telegram.InlineKeyboardMarkup{
-					InlineKeyboard: [][]telegram.InlineKeyboardButton{
-						{
-							{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
-							{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
-						},
-						{{Text: "🔗 Open in Jules", URL: session.URL}},
-					},
-				}
-				if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard); err == nil {
-					firestoreClient.SetCompletionSent(ctx, chat.ChatID, true)
-				}
-			} else if session.State == "FAILED" {
-				if err := telegramClient.SendMessage(chat.ChatID, "❌ <b>Jules task failed</b>\nThe session encountered an error."); err == nil {
-					firestoreClient.SetCompletionSent(ctx, chat.ChatID, true)
-				}
-			}
-		}
 	}
 
 	w.WriteHeader(http.StatusOK)
