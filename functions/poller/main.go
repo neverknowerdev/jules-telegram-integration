@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 
@@ -380,7 +379,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			runtime.GC()
 			return nil
 		})
 
@@ -393,10 +391,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		if !anyWaitingNow {
 			log.Println("No tasks waiting for Jules. Exiting long-running poller.")
 			break
-		}
-
-		if minInteractiveInterval == 999999 {
-			minInteractiveInterval = 5
 		}
 
 		time.Sleep(time.Duration(minInteractiveInterval) * time.Second)

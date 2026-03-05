@@ -21,6 +21,12 @@ gcloud functions deploy jules-poller \
 
 echo "Poller deployment complete!"
 
+echo "Configuring Poller to Never Sleep (Always Allocated CPU)..."
+gcloud run services update jules-poller \
+    --region=us-central1 \
+    --no-cpu-throttling \
+    --quiet
+
 POLLER_URL=$(gcloud functions describe jules-poller --gen2 --region=us-central1 --format="value(serviceConfig.uri)")
 
 echo "Deploying Webhook Function to GCP..."

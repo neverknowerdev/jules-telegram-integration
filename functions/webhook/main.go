@@ -448,7 +448,13 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		telegramClient.AnswerCallbackQuery(callbackID, "")
 
 		// Store which setting we're changing
-		err := firestoreClient.UpdateChatState(ctx, chatID, "waiting_for_setting:"+settingType, "")
+		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID)
+		draftSource := ""
+		if err == nil && chatConfig != nil {
+			draftSource = chatConfig.DraftSource
+		}
+
+		err = firestoreClient.UpdateChatState(ctx, chatID, "waiting_for_setting:"+settingType, draftSource)
 		if err != nil {
 			log.Printf("Failed to update state: %v", err)
 			return
@@ -744,7 +750,7 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 		var val int
 		if _, err := fmt.Sscanf(text, "%d", &val); err != nil || val <= 0 {
 			telegramClient.SendMessage(chatID, "Invalid number. Settings unchanged.")
-			firestoreClient.UpdateChatState(ctx, chatID, "", "")
+			firestoreClient.UpdateChatState(ctx, chatID, "", chatConfig.DraftSource)
 			return
 		}
 
@@ -762,7 +768,7 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 			return
 		}
 
-		firestoreClient.UpdateChatState(ctx, chatID, "", "")
+		firestoreClient.UpdateChatState(ctx, chatID, "", chatConfig.DraftSource)
 		telegramClient.SendMessage(chatID, fmt.Sprintf("✅ Settings updated!\nInteractive: %ds\nStandard: %dm", interactive, standard))
 		return
 	}
