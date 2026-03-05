@@ -123,7 +123,7 @@ func TestPoller_NewActivities(t *testing.T) {
 		t.Errorf("Expected progress message to be sent")
 	}
 
-	// Test if it edits existing message properly with timestamp
+	// Test if it edits existing message properly with new content
 	config.ProgressMessageID = 999
 	jc.Activities = append(jc.Activities, jules.Activity{
 		Id: "act3",
@@ -131,7 +131,7 @@ func TestPoller_NewActivities(t *testing.T) {
 		ProgressUpdated: &struct {
 			Title       string `json:"title"`
 			Description string `json:"description"`
-		}{Title: "Thinking Again", Description: "Checking more files..."},
+		}{Title: "Executing step 3", Description: "Checking more files..."},
 	})
 	rr = sendPollerRequest(t)
 	if rr.Code != http.StatusOK {
@@ -139,8 +139,8 @@ func TestPoller_NewActivities(t *testing.T) {
 	}
 	if len(tc.EditedMessages) == 0 {
 		t.Errorf("Expected message to be edited")
-	} else if !strings.Contains(tc.EditedMessages[0], "Last updated:") {
-		t.Errorf("Expected edited message to contain timestamp, got %s", tc.EditedMessages[0])
+	} else if !strings.Contains(tc.EditedMessages[0], "Executing step 3") {
+		t.Errorf("Expected edited message to contain new content, got %s", tc.EditedMessages[0])
 	}
 }
 

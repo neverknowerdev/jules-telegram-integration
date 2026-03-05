@@ -8,7 +8,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
@@ -258,18 +257,33 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Slice strictly to last 15 items to prevent Telegram 4096 char limits entirely
-			if len(allProgressLines) > 15 {
-				allProgressLines = allProgressLines[len(allProgressLines)-15:]
-			}
-
 			if len(allProgressLines) > 0 || progressMsgID == 0 {
 				header := "⚙️ <b>Jules is working on it...</b>\n\n"
-				body := strings.Join(allProgressLines, "\n\n")
-				if body == "" {
-					body = "<i>Jules is thinking...</i>"
+
+				// Instead of an arbitrary 15 item limit, we pack as many as we can fit within ~4000 characters
+				// We iterate backwards (newest to oldest) so we always show the newest.
+				var finalLines []string
+				currentLen := len(header)
+
+				for i := len(allProgressLines) - 1; i >= 0; i-- {
+					lineLen := len(allProgressLines[i]) + 2 // +2 for the \n\n
+					if currentLen + lineLen > 4000 {
+						// Add a truncation indicator at the top if we had to cut lines
+						finalLines = append([]string{"<i>...older steps omitted...</i>"}, finalLines...)
+						break
+					}
+					// Prepend to final lines to maintain chronological order
+					finalLines = append([]string{allProgressLines[i]}, finalLines...)
+					currentLen += lineLen
 				}
-				msg := header + body
+
+				body := strings.Join(finalLines, "\n\n")
+				var msg string
+				if body == "" {
+					msg = strings.TrimSpace(header)
+				} else {
+					msg = header + body
+				}
 
 				if progressMsgID == 0 {
 					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
@@ -279,10 +293,9 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create progress message: %v", chat.ChatID, chat.ThreadID, err)
 					}
 				} else {
-					// Add an explicit timestamp so Telegram recognizes content changed and shows "edited"
-					// Also it ensures telegram doesn't skip the edit if the main text remains identical
-					msgWithTime := fmt.Sprintf("%s\n\n<i>Last updated: %s</i>", msg, time.Now().Format("15:04:05"))
-					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msgWithTime, nil); err != nil {
+					// Telegram natively shows an "edited" label with time when the text actually changes.
+					// Since we only edit when there's new progress, the text will differ naturally.
+					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
 						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, err)
 						// If edit fails (e.g., message deleted), try sending a new one
 						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
