@@ -192,3 +192,36 @@ func TestWebhook_Callback_TopicRepo(t *testing.T) {
 		t.Errorf("Expected edited message prompting for input")
 	}
 }
+
+func TestWebhook_ApprovePlanCallback_RoutedToCorrectThread(t *testing.T) {
+	tc, _, fc := setupMocks()
+
+	// Create a chat config so GetChatsByChatID finds the right thread
+	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+		ChatID:         123,
+		ThreadID:       456,
+		CurrentSession: "sessions/1",
+	}
+
+	update := telegram.Update{
+		CallbackQuery: &telegram.CallbackQuery{
+			ID: "callback2",
+			Data: "approve_plan:1",
+			Message: &telegram.Message{
+				Chat: &telegram.Chat{ID: 123},
+			},
+		},
+	}
+
+	sendWebhookRequest(t, update)
+
+	if len(tc.SentMessages) == 0 {
+		t.Errorf("Expected success message")
+	} else if !strings.Contains(tc.SentMessages[0], "Plan approved successfully") {
+		t.Errorf("Expected plan approved message, got %s", tc.SentMessages[0])
+	}
+
+	if len(tc.SentThreadIDs) == 0 || tc.SentThreadIDs[0] != 456 {
+		t.Errorf("Expected message to be sent to thread ID 456")
+	}
+}

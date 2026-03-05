@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
@@ -178,15 +179,34 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			if act.SessionCompleted != nil {
 				msg := formatCompletionMessage(session)
 				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-				keyboard := telegram.InlineKeyboardMarkup{
-					InlineKeyboard: [][]telegram.InlineKeyboardButton{
-						{
-							{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
-							{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
-						},
-						{{Text: "🔗 Open in Jules", URL: session.URL}},
-					},
+
+				var inlineButtons [][]telegram.InlineKeyboardButton
+				hasPR := false
+				var prURL string
+
+				for _, output := range session.Outputs {
+					if output.PullRequest != nil && output.PullRequest.URL != "" {
+						hasPR = true
+						prURL = output.PullRequest.URL
+						break
+					}
 				}
+
+				if hasPR {
+					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+						{Text: "🔗 View Pull Request", URL: prURL},
+					})
+				} else {
+					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+						{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+						{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+					})
+				}
+				inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+					{Text: "🔗 Open in Jules", URL: session.URL},
+				})
+
+				keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
 				telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard)
 				continue
 			}
@@ -258,7 +278,10 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create progress message: %v", chat.ChatID, chat.ThreadID, err)
 					}
 				} else {
-					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
+					// Add an explicit timestamp so Telegram recognizes content changed and shows "edited"
+					// Also it ensures telegram doesn't skip the edit if the main text remains identical
+					msgWithTime := fmt.Sprintf("%s\n\n<i>Last updated: %s</i>", msg, time.Now().Format("15:04:05"))
+					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msgWithTime, nil); err != nil {
 						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, err)
 						// If edit fails (e.g., message deleted), try sending a new one
 						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
@@ -282,7 +305,11 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					keyboard := telegram.InlineKeyboardMarkup{
 						InlineKeyboard: [][]telegram.InlineKeyboardButton{{{Text: "🔗 View Pull Request", URL: prURL}}},
 					}
-					if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard); err == nil {
+
+					telegramClient.UnpinAllChatMessages(chat.ChatID, chat.ThreadID)
+
+					if msgID, err := telegramClient.SendMessageWithKeyboardReturningID(chat.ChatID, chat.ThreadID, msg, keyboard); err == nil {
+						telegramClient.PinChatMessage(chat.ChatID, chat.ThreadID, msgID)
 						firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, chat.ThreadID, prURL)
 						// Update the chat object in memory for subsequent checks within the same poller run
 						if chat.NotifiedPRs == nil {

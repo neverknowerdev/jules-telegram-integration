@@ -617,16 +617,23 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		sessionIDShort := strings.TrimPrefix(data, "approve_plan:")
 		sessionName := "sessions/" + sessionIDShort
 
-		// We could extract threadID but for Approve Plan the chatID + old topic is tricky if the topic ID isn't in callback.
-		// A real implementation would store threadID in the session or in the callback data.
-		// For backward compatibility we will just guess the thread ID from the ChatConfig if it is mapped, but that's hard to do without iterating.
-		// For now we'll just send to main chat if threadID isn't encoded. Let's send to 0.
+		// Determine the thread ID associated with this session
+		var targetThreadID int
+		if chats, err := firestoreClient.GetChatsByChatID(ctx, chatID); err == nil {
+			for _, chat := range chats {
+				if chat.CurrentSession == sessionName {
+					targetThreadID = chat.ThreadID
+					break
+				}
+			}
+		}
+
 		telegramClient.AnswerCallbackQuery(callbackID, "Approving...")
 		if err := julesClient.ApprovePlan(sessionName); err != nil {
 			log.Printf("Failed to approve plan: %v", err)
-			telegramClient.SendMessage(chatID, 0, fmt.Sprintf("❌ Failed to approve plan: %v", err))
+			telegramClient.SendMessage(chatID, targetThreadID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
-			telegramClient.SendMessage(chatID, 0, "✅ Plan approved successfully!")
+			telegramClient.SendMessage(chatID, targetThreadID, "✅ Plan approved successfully!")
 		}
 		return
 	}
@@ -715,17 +722,35 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 					telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msg, keyboard)
 				} else if act.SessionCompleted != nil {
 					msg := formatCompletionMessage(session)
-
 					sessionIDShort := strings.TrimPrefix(session.Name, "sessions/")
-					keyboard := telegram.InlineKeyboardMarkup{
-						InlineKeyboard: [][]telegram.InlineKeyboardButton{
-							{
-								{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
-								{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
-							},
-							{{Text: "🔗 Open in Jules", URL: session.URL}},
-						},
+
+					var inlineButtons [][]telegram.InlineKeyboardButton
+					hasPR := false
+					var prURL string
+
+					for _, output := range session.Outputs {
+						if output.PullRequest != nil && output.PullRequest.URL != "" {
+							hasPR = true
+							prURL = output.PullRequest.URL
+							break
+						}
 					}
+
+					if hasPR {
+						inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+							{Text: "🔗 View Pull Request", URL: prURL},
+						})
+					} else {
+						inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+							{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+							{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+						})
+					}
+					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+						{Text: "🔗 Open in Jules", URL: session.URL},
+					})
+
+					keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
 					telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msg, keyboard)
 				} else if act.SessionFailed != nil {
 					reason := act.SessionFailed.Reason
@@ -744,13 +769,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			Keyboard: [][]telegram.KeyboardButton{
 				{
 					{Text: "🔄 Sync"},
-				},
-				{
-					{Text: "🗑 Remove Topic"},
 					{Text: "📦 Archive Task"},
-				},
-				{
-					{Text: "🏠 Main Menu"},
 				},
 			},
 			ResizeKeyboard: true,
@@ -1081,13 +1100,7 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 				Keyboard: [][]telegram.KeyboardButton{
 					{
 						{Text: "🔄 Sync"},
-					},
-					{
-						{Text: "🗑 Remove Topic"},
 						{Text: "📦 Archive Task"},
-					},
-					{
-						{Text: "🏠 Main Menu"},
 					},
 				},
 				ResizeKeyboard: true,

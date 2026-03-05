@@ -64,6 +64,7 @@ func (m *MockJulesClient) ApprovePlan(sessionName string) error {
 
 type MockTelegramClient struct {
 	SentMessages          []string
+	SentThreadIDs         []int
 	SentKeyboards         []telegram.InlineKeyboardMarkup
 	SentReplyKeyboards    []telegram.ReplyKeyboardMarkup
 	DeletedTopics         []int
@@ -76,11 +77,13 @@ type MockTelegramClient struct {
 
 func (m *MockTelegramClient) SendMessage(chatID int64, threadID int, text string) error {
 	m.SentMessages = append(m.SentMessages, text)
+	m.SentThreadIDs = append(m.SentThreadIDs, threadID)
 	return nil
 }
 
 func (m *MockTelegramClient) SendMessageReturningID(chatID int64, threadID int, text string) (int, error) {
 	m.SentMessages = append(m.SentMessages, text)
+	m.SentThreadIDs = append(m.SentThreadIDs, threadID)
 	return m.SendMessageReturnID, nil
 }
 
@@ -88,6 +91,12 @@ func (m *MockTelegramClient) SendMessageWithKeyboard(chatID int64, threadID int,
 	m.SentMessages = append(m.SentMessages, text)
 	m.SentKeyboards = append(m.SentKeyboards, keyboard)
 	return nil
+}
+
+func (m *MockTelegramClient) SendMessageWithKeyboardReturningID(chatID int64, threadID int, text string, keyboard telegram.InlineKeyboardMarkup) (int, error) {
+	m.SentMessages = append(m.SentMessages, text)
+	m.SentKeyboards = append(m.SentKeyboards, keyboard)
+	return m.SendMessageReturnID, nil
 }
 
 func (m *MockTelegramClient) SendMessageWithReplyKeyboard(chatID int64, threadID int, text string, keyboard telegram.ReplyKeyboardMarkup) error {
@@ -123,6 +132,14 @@ func (m *MockTelegramClient) CreateForumTopic(chatID int64, name string) (int, e
 
 func (m *MockTelegramClient) DeleteForumTopic(chatID int64, threadID int) error {
 	m.DeletedTopics = append(m.DeletedTopics, threadID)
+	return nil
+}
+
+func (m *MockTelegramClient) PinChatMessage(chatID int64, threadID int, messageID int) error {
+	return nil
+}
+
+func (m *MockTelegramClient) UnpinAllChatMessages(chatID int64, threadID int) error {
 	return nil
 }
 

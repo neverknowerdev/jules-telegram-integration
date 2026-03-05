@@ -122,6 +122,26 @@ func TestPoller_NewActivities(t *testing.T) {
 	if !foundProgressMessage {
 		t.Errorf("Expected progress message to be sent")
 	}
+
+	// Test if it edits existing message properly with timestamp
+	config.ProgressMessageID = 999
+	jc.Activities = append(jc.Activities, jules.Activity{
+		Id: "act3",
+		Originator: "system",
+		ProgressUpdated: &struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+		}{Title: "Thinking Again", Description: "Checking more files..."},
+	})
+	rr = sendPollerRequest(t)
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", rr.Code)
+	}
+	if len(tc.EditedMessages) == 0 {
+		t.Errorf("Expected message to be edited")
+	} else if !strings.Contains(tc.EditedMessages[0], "Last updated:") {
+		t.Errorf("Expected edited message to contain timestamp, got %s", tc.EditedMessages[0])
+	}
 }
 
 func TestPoller_SessionCompletedAndPR(t *testing.T) {
@@ -172,6 +192,24 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 	config := fc.Configs["mock_doc_id"]
 	if config.State != "COMPLETED" {
 		t.Errorf("Expected state to be updated to COMPLETED")
+	}
+
+	// Verify PR view button is present, instead of create PR
+	foundViewPR := false
+	for _, kb := range tc.SentKeyboards {
+		for _, row := range kb.InlineKeyboard {
+			for _, btn := range row {
+				if strings.Contains(btn.Text, "View Pull Request") {
+					foundViewPR = true
+				}
+				if strings.Contains(btn.Text, "Create PR") {
+					t.Errorf("Expected Create PR button to be removed")
+				}
+			}
+		}
+	}
+	if !foundViewPR {
+		t.Errorf("Expected View Pull Request button")
 	}
 }
 

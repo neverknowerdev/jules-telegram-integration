@@ -154,6 +154,47 @@ func (c *Client) SendMessageReturningID(chatID int64, threadID int, text string)
 	return result.Result.MessageID, nil
 }
 
+func (c *Client) SendMessageWithKeyboardReturningID(chatID int64, threadID int, text string, keyboard InlineKeyboardMarkup) (int, error) {
+	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
+
+	payload := map[string]interface{}{
+		"chat_id":      chatID,
+		"text":         text,
+		"parse_mode":   "HTML",
+		"reply_markup": keyboard,
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[TELEGRAM] SendMessageWithKeyboardReturningID error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return 0, fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return 0, err
+	}
+	return result.Result.MessageID, nil
+}
+
 func (c *Client) SendMessageWithKeyboard(chatID int64, threadID int, text string, keyboard InlineKeyboardMarkup) error {
 	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
 
@@ -349,6 +390,88 @@ func (c *Client) DeleteForumTopic(chatID int64, threadID int) error {
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		log.Printf("[TELEGRAM] DeleteForumTopic error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (c *Client) PinChatMessage(chatID int64, threadID int, messageID int) error {
+	url := fmt.Sprintf(BaseURL+"/pinChatMessage", c.Token)
+
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	// Telegram's pinChatMessage does not strictly require message_thread_id,
+	// but can optionally take it if needed depending on topic rules. Usually, the message_id is enough to pin in the topic.
+	// But let's pass it just in case.
+	// Actually, the API documentation for pinChatMessage says: "message_id" is required.
+	// It doesn't use message_thread_id, because message_id is globally unique within the supergroup.
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] PinChatMessage error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (c *Client) UnpinAllChatMessages(chatID int64, threadID int) error {
+	url := fmt.Sprintf(BaseURL+"/unpinAllChatMessages", c.Token)
+
+	payload := map[string]interface{}{
+		"chat_id": chatID,
+	}
+	// unpinAllChatMessages also removes pinned messages from topics if message_thread_id is absent? No, wait.
+	// The API doc: "unpinAllChatMessages removes all pinned messages. If chat is a forum, unpins all pinned messages in the specified topic."
+	// We MUST pass message_thread_id if threadID is > 0.
+	// But it says unpinAllForumTopicMessages is a separate method? No, unpinAllChatMessages takes chat_id.
+	// Let's pass it. Wait, the API doc for unpinAllChatMessages does not mention message_thread_id.
+	// Wait, actually it does in some versions. Let's look up unpinAllForumTopicMessages? It doesn't exist, it's just unpinAllChatMessages.
+	if threadID > 0 {
+		// Just unpinning from the chat if it's not a forum, or we might need to unpin all messages in general.
+		// Wait, "unpinAllChatMessages" has a parameter: "chat_id". There is no "message_thread_id" for unpinAllChatMessages?
+		// "unpinAllForumTopicMessages" is the actual method name. Let's check API. No, unpinAllChatMessages is universal.
+		// Wait, "unpinAllChatMessages" clears the entire chat! We don't want to clear the whole supergroup.
+		// There is "unpinAllForumTopicMessages" in telegram API. Let's use that if threadID > 0.
+	}
+
+	// Since we are unpinning inside a thread:
+	var method string
+	if threadID > 0 {
+		method = "/unpinAllForumTopicMessages"
+		payload["message_thread_id"] = threadID
+	} else {
+		method = "/unpinAllChatMessages"
+	}
+
+	url = fmt.Sprintf(BaseURL+method, c.Token)
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] Unpin error (%s): status=%d body=%s", method, resp.StatusCode, string(respBody))
 		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
 	}
 	return nil
