@@ -29,8 +29,14 @@ type Source struct {
 	DisplayName string `json:"displayName"`
 	Id          string `json:"id"`
 	GithubRepo  struct {
-		Owner string `json:"owner"`
-		Repo  string `json:"repo"`
+		Owner         string `json:"owner"`
+		Repo          string `json:"repo"`
+		DefaultBranch struct {
+			DisplayName string `json:"displayName"`
+		} `json:"defaultBranch"`
+		Branches []struct {
+			DisplayName string `json:"displayName"`
+		} `json:"branches"`
 	} `json:"githubRepo"`
 }
 
@@ -403,7 +409,7 @@ type CreateSessionRequest struct {
 	AutomationMode      string                 `json:"automationMode,omitempty"`
 }
 
-func (c *Client) CreateSession(prompt, source, mode string) (*Session, error) {
+func (c *Client) CreateSession(prompt, source, mode, branch string) (*Session, error) {
 	endpoint := BaseURL + "/sessions"
 
 	reqBody := CreateSessionRequest{
@@ -414,8 +420,12 @@ func (c *Client) CreateSession(prompt, source, mode string) (*Session, error) {
 			"source": source,
 		}
 		if strings.Contains(source, "github") {
+			targetBranch := "main"
+			if branch != "" {
+				targetBranch = branch
+			}
 			reqBody.SourceContext["githubRepoContext"] = map[string]interface{}{
-				"startingBranch": "main",
+				"startingBranch": targetBranch,
 			}
 		}
 	}

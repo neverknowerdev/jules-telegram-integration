@@ -7,7 +7,7 @@ type ClientInterface interface {
 	ListActivities(sessionName string, sinceID string) ([]Activity, error)
 	ListAllActivities(sessionName string) ([]Activity, error)
 	SendMessage(sessionName, message string) error
-	CreateSession(prompt, source, mode string) (*Session, error)
+	CreateSession(prompt, source, mode, branch string) (*Session, error)
 	ArchiveSession(sessionName string) error
 	ApprovePlan(sessionName string) error
 }

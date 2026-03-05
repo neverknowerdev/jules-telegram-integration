@@ -11,6 +11,7 @@ type ClientInterface interface {
 	DeleteChatConfig(ctx context.Context, chatID int64, threadID int) error
 	UpdateCurrentSession(ctx context.Context, chatID int64, threadID int, sessionID string) error
 	UpdateChatState(ctx context.Context, chatID int64, threadID int, state, draftSource string) error
+	UpdateDraftBranch(ctx context.Context, chatID int64, threadID int, draftBranch string) error
 	UpdateCreationMode(ctx context.Context, chatID int64, threadID int, mode string) error
 	UpdateLastActivity(ctx context.Context, chatID int64, threadID int, activityID string) error
 	UpdateProgressMessageID(ctx context.Context, chatID int64, threadID int, messageID int) error

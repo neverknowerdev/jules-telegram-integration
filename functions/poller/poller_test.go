@@ -61,7 +61,7 @@ func TestPoller_EmptyChats(t *testing.T) {
 func TestPoller_NewActivities(t *testing.T) {
 	tc, jc, fc := setupMocks()
 
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123_456"] = &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/1",
@@ -105,7 +105,7 @@ func TestPoller_NewActivities(t *testing.T) {
 	}
 
 	// Verify progress message updated
-	config := fc.Configs["mock_doc_id"]
+	config := fc.Configs["123_456"]
 	// The mock telegram client returns 0 for SendMessageReturnID, so we expect 0 unless we explicitly mock a return ID
 	// Let's modify the setup or check to reflect this.
 	// We'll just verify the last activity ID is updated for now.
@@ -147,7 +147,7 @@ func TestPoller_NewActivities(t *testing.T) {
 func TestPoller_SessionCompletedAndPR(t *testing.T) {
 	tc, jc, fc := setupMocks()
 
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123_456"] = &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/2", // This is mocked as COMPLETED with a PR output
@@ -189,7 +189,7 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 		t.Errorf("Expected PR notification")
 	}
 
-	config := fc.Configs["mock_doc_id"]
+	config := fc.Configs["123_456"]
 	if config.State != "COMPLETED" {
 		t.Errorf("Expected state to be updated to COMPLETED")
 	}
@@ -216,7 +216,7 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 func TestPoller_SessionFailed(t *testing.T) {
 	tc, jc, fc := setupMocks()
 
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123_456"] = &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/1",

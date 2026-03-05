@@ -11,6 +11,7 @@ type ClientInterface interface {
 	SetWebhook(webhookURL string) error
 	CreateForumTopic(chatID int64, name string) (int, error)
 	DeleteForumTopic(chatID int64, threadID int) error
+	EditForumTopic(chatID int64, threadID int, name string) error
 	PinChatMessage(chatID int64, threadID int, messageID int) error
 	UnpinAllChatMessages(chatID int64, threadID int) error
 }

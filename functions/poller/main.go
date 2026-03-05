@@ -204,6 +204,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 				inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
 					{Text: "🔗 Open in Jules", URL: session.URL},
+					{Text: "👯 Clone Task", CallbackData: "clone:" + sessionIDShort},
 				})
 
 				keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}

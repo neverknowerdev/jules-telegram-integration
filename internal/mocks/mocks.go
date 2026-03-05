@@ -2,6 +2,7 @@ package mocks
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
@@ -47,7 +48,7 @@ func (m *MockJulesClient) SendMessage(sessionName, message string) error {
 	return nil
 }
 
-func (m *MockJulesClient) CreateSession(prompt, source, mode string) (*jules.Session, error) {
+func (m *MockJulesClient) CreateSession(prompt, source, mode, branch string) (*jules.Session, error) {
 	if m.CreatedSession != nil {
 		return m.CreatedSession, nil
 	}
@@ -135,6 +136,10 @@ func (m *MockTelegramClient) DeleteForumTopic(chatID int64, threadID int) error 
 	return nil
 }
 
+func (m *MockTelegramClient) EditForumTopic(chatID int64, threadID int, name string) error {
+	return nil
+}
+
 func (m *MockTelegramClient) PinChatMessage(chatID int64, threadID int, messageID int) error {
 	return nil
 }
@@ -156,18 +161,20 @@ func NewMockFirestoreClient() *MockFirestoreClient {
 
 func (m *MockFirestoreClient) getDocID(chatID int64, threadID int) string {
 	if threadID > 0 {
-		return "mock_doc_id" // simplistic for now
+		return fmt.Sprintf("%d_%d", chatID, threadID)
 	}
-	return "mock_doc_id"
+	return fmt.Sprintf("%d", chatID)
 }
 
 func (m *MockFirestoreClient) SaveChatConfig(ctx context.Context, config firestore.ChatConfig) error {
-	m.Configs["mock_doc_id"] = &config
+	docID := m.getDocID(config.ChatID, config.ThreadID)
+	m.Configs[docID] = &config
 	return nil
 }
 
 func (m *MockFirestoreClient) GetChatConfig(ctx context.Context, chatID int64, threadID int) (*firestore.ChatConfig, error) {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		return config, nil
 	}
 	return nil, nil // Return empty config for test
@@ -175,19 +182,23 @@ func (m *MockFirestoreClient) GetChatConfig(ctx context.Context, chatID int64, t
 
 func (m *MockFirestoreClient) GetChatsByChatID(ctx context.Context, chatID int64) ([]firestore.ChatConfig, error) {
 	var chats []firestore.ChatConfig
-	if config, ok := m.Configs["mock_doc_id"]; ok {
-		chats = append(chats, *config)
+	for _, config := range m.Configs {
+		if config.ChatID == chatID {
+			chats = append(chats, *config)
+		}
 	}
 	return chats, nil
 }
 
 func (m *MockFirestoreClient) DeleteChatConfig(ctx context.Context, chatID int64, threadID int) error {
-	delete(m.Configs, "mock_doc_id")
+	docID := m.getDocID(chatID, threadID)
+	delete(m.Configs, docID)
 	return nil
 }
 
 func (m *MockFirestoreClient) UpdateCurrentSession(ctx context.Context, chatID int64, threadID int, sessionID string) error {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		config.CurrentSession = sessionID
 	}
 	m.Updates = append(m.Updates, "UpdateCurrentSession")
@@ -195,7 +206,8 @@ func (m *MockFirestoreClient) UpdateCurrentSession(ctx context.Context, chatID i
 }
 
 func (m *MockFirestoreClient) UpdateChatState(ctx context.Context, chatID int64, threadID int, state, draftSource string) error {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		config.State = state
 		config.DraftSource = draftSource
 	}
@@ -203,8 +215,18 @@ func (m *MockFirestoreClient) UpdateChatState(ctx context.Context, chatID int64,
 	return nil
 }
 
+func (m *MockFirestoreClient) UpdateDraftBranch(ctx context.Context, chatID int64, threadID int, draftBranch string) error {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
+		config.DraftBranch = draftBranch
+	}
+	m.Updates = append(m.Updates, "UpdateDraftBranch")
+	return nil
+}
+
 func (m *MockFirestoreClient) UpdateCreationMode(ctx context.Context, chatID int64, threadID int, mode string) error {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		config.CreationMode = mode
 	}
 	m.Updates = append(m.Updates, "UpdateCreationMode")
@@ -212,7 +234,8 @@ func (m *MockFirestoreClient) UpdateCreationMode(ctx context.Context, chatID int
 }
 
 func (m *MockFirestoreClient) UpdateLastActivity(ctx context.Context, chatID int64, threadID int, activityID string) error {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		config.LastActivityID = activityID
 	}
 	m.Updates = append(m.Updates, "UpdateLastActivity")
@@ -220,7 +243,8 @@ func (m *MockFirestoreClient) UpdateLastActivity(ctx context.Context, chatID int
 }
 
 func (m *MockFirestoreClient) UpdateProgressMessageID(ctx context.Context, chatID int64, threadID int, messageID int) error {
-	if config, ok := m.Configs["mock_doc_id"]; ok {
+	docID := m.getDocID(chatID, threadID)
+	if config, ok := m.Configs[docID]; ok {
 		config.ProgressMessageID = messageID
 	}
 	m.Updates = append(m.Updates, "UpdateProgressMessageID")

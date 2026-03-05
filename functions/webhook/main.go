@@ -119,6 +119,12 @@ func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *
 		return
 	}
 
+	// Do not overwrite existing configs (e.g. from cloned tasks)
+	existingConfig, _ := firestoreClient.GetChatConfig(ctx, chatID, threadID)
+	if existingConfig != nil && existingConfig.State != "" {
+		return
+	}
+
 	config := firestore.ChatConfig{
 		ChatID:   chatID,
 		ThreadID: threadID,
@@ -484,13 +490,148 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			return
 		}
 
-		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_message", fullSource); err != nil {
+		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_branch", fullSource); err != nil {
+			log.Printf("Failed to update chat state: %v", err)
+			telegramClient.SendMessage(chatID, threadID, "An error occurred.")
+			return
+		}
+
+		var branchButtons [][]telegram.InlineKeyboardButton
+		var currentRow []telegram.InlineKeyboardButton
+
+		// Fetch branches for this source
+		var branches []string
+		for _, s := range sources {
+			if s.Name == fullSource {
+				for _, b := range s.GithubRepo.Branches {
+					branches = append(branches, b.DisplayName)
+				}
+				break
+			}
+		}
+
+		// If no branches or just main, we can fallback, but let's provide default
+		if len(branches) == 0 {
+			branches = []string{"main"}
+		}
+
+		idx := 1
+		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", repoName)
+		for _, branch := range branches {
+			msgBuilder += fmt.Sprintf("%d. %s\n", idx, branch)
+			btn := telegram.InlineKeyboardButton{
+				Text:         fmt.Sprintf("%d", idx),
+				CallbackData: fmt.Sprintf("topicbranch:%d:%s", threadID, branch),
+			}
+			currentRow = append(currentRow, btn)
+
+			if len(currentRow) == 5 {
+				branchButtons = append(branchButtons, currentRow)
+				currentRow = nil
+			}
+			idx++
+		}
+		if len(currentRow) > 0 {
+			branchButtons = append(branchButtons, currentRow)
+		}
+
+		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
+		telegramClient.EditMessageText(chatID, messageID, msgBuilder, &keyboard)
+		return
+	}
+
+	// Handle topic branch selection callback
+	if strings.HasPrefix(data, "topicbranch:") {
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) != 3 {
+			return
+		}
+		threadIDStr := parts[1]
+		branchName := parts[2]
+
+		var threadID int
+		fmt.Sscanf(threadIDStr, "%d", &threadID)
+
+		telegramClient.AnswerCallbackQuery(callbackID, "")
+
+		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
+		if err != nil || chatConfig == nil {
+			telegramClient.SendMessage(chatID, threadID, "Could not find chat config.")
+			return
+		}
+
+		if err := firestoreClient.UpdateDraftBranch(ctx, chatID, threadID, branchName); err != nil {
+			log.Printf("Failed to update draft branch: %v", err)
+		}
+
+		// If we are currently selecting a branch while waiting for title (i.e. cloned task branch change)
+		if chatConfig.State == "waiting_for_title" {
+			telegramClient.AnswerCallbackQuery(callbackID, "Branch updated")
+			// Update the prompt message inline keyboard to reflect the new selected branch
+			// We can re-fetch branches and recreate the inline keyboard
+			var branches []string
+			sources, _ := julesClient.ListSources()
+			for _, s := range sources {
+				if s.Name == chatConfig.DraftSource {
+					for _, b := range s.GithubRepo.Branches {
+						branches = append(branches, b.DisplayName)
+					}
+					break
+				}
+			}
+			if len(branches) == 0 {
+				branches = []string{"main"}
+			}
+
+			var branchButtons [][]telegram.InlineKeyboardButton
+			var currentRow []telegram.InlineKeyboardButton
+			idx := 1
+
+			repoPart := chatConfig.DraftSource
+			sourceParts := strings.Split(chatConfig.DraftSource, "/")
+			if len(sourceParts) >= 2 {
+				repoPart = sourceParts[len(sourceParts)-1]
+			}
+
+			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", repoPart, branchName)
+
+			for _, branch := range branches {
+				btnText := fmt.Sprintf("%d", idx)
+				if branch == branchName {
+					btnText = "✅ " + btnText
+				}
+				btn := telegram.InlineKeyboardButton{
+					Text:         btnText,
+					CallbackData: fmt.Sprintf("topicbranch:%d:%s", threadID, branch),
+				}
+				currentRow = append(currentRow, btn)
+				if len(currentRow) == 5 {
+					branchButtons = append(branchButtons, currentRow)
+					currentRow = nil
+				}
+				idx++
+			}
+			if len(currentRow) > 0 {
+				branchButtons = append(branchButtons, currentRow)
+			}
+			keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
+			telegramClient.EditMessageText(chatID, messageID, msgBuilder, &keyboard)
+			return
+		}
+
+		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_message", chatConfig.DraftSource); err != nil {
 			log.Printf("Failed to update chat state: %v", err)
 			telegramClient.SendMessage(chatID, threadID, "An error occurred.")
 			return
 		}
 		if err := firestoreClient.UpdateCreationMode(ctx, chatID, threadID, "interactive"); err != nil {
 			log.Printf("Failed to update creation mode: %v", err)
+		}
+
+		repoPart := ""
+		sourceParts := strings.Split(chatConfig.DraftSource, "/")
+		if len(sourceParts) >= 2 {
+			repoPart = sourceParts[len(sourceParts)-1]
 		}
 
 		var modeButtons [][]telegram.InlineKeyboardButton
@@ -504,7 +645,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		})
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: modeButtons}
-		msg := fmt.Sprintf("✏️ <b>Repository:</b> %s\nMode selected: <b>interactive</b>\n\n<i>You can change it using buttons below.</i>\n\nPlease enter the initial message for this new task:", repoName)
+		msg := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nMode selected: <b>interactive</b>\n\n<i>You can change it using buttons below.</i>\n\nPlease enter the initial message for this new task:", repoPart, branchName)
 		telegramClient.EditMessageText(chatID, messageID, msg, &keyboard)
 		return
 	}
@@ -531,28 +672,51 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			return
 		}
 
-		if err := firestoreClient.UpdateChatState(ctx, chatID, 0, "waiting_for_message", fullSource); err != nil {
+		if err := firestoreClient.UpdateChatState(ctx, chatID, 0, "waiting_for_branch", fullSource); err != nil {
 			log.Printf("Failed to update chat state: %v", err)
 			telegramClient.SendMessage(chatID, 0, "An error occurred.")
 			return
 		}
-		if err := firestoreClient.UpdateCreationMode(ctx, chatID, 0, "interactive"); err != nil {
-			log.Printf("Failed to update creation mode: %v", err)
+
+		var branchButtons [][]telegram.InlineKeyboardButton
+		var currentRow []telegram.InlineKeyboardButton
+
+		var branches []string
+		for _, s := range sources {
+			if s.Name == fullSource {
+				for _, b := range s.GithubRepo.Branches {
+					branches = append(branches, b.DisplayName)
+				}
+				break
+			}
 		}
 
-		var modeButtons [][]telegram.InlineKeyboardButton
-		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "💡 Interactive (Default)", CallbackData: "mode:0:interactive"},
-			{Text: "🚀 Start", CallbackData: "mode:0:start"},
-		})
-		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "👀 Review", CallbackData: "mode:0:review"},
-			{Text: "⏳ Scheduled", CallbackData: "mode:0:scheduled"},
-		})
+		if len(branches) == 0 {
+			branches = []string{"main"}
+		}
 
-		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: modeButtons}
-		msg := fmt.Sprintf("✏️ <b>Repository:</b> %s\nMode selected: <b>interactive</b>\n\n<i>You can change it using buttons below.</i>\n\nPlease enter the initial message for this new task:", repoName)
-		telegramClient.SendMessageWithKeyboard(chatID, 0, msg, keyboard)
+		idx := 1
+		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", repoName)
+		for _, branch := range branches {
+			msgBuilder += fmt.Sprintf("%d. %s\n", idx, branch)
+			btn := telegram.InlineKeyboardButton{
+				Text:         fmt.Sprintf("%d", idx),
+				CallbackData: fmt.Sprintf("topicbranch:0:%s", branch),
+			}
+			currentRow = append(currentRow, btn)
+
+			if len(currentRow) == 5 {
+				branchButtons = append(branchButtons, currentRow)
+				currentRow = nil
+			}
+			idx++
+		}
+		if len(currentRow) > 0 {
+			branchButtons = append(branchButtons, currentRow)
+		}
+
+		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
+		telegramClient.SendMessageWithKeyboard(chatID, 0, msgBuilder, keyboard)
 		return
 	}
 
@@ -635,6 +799,144 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		} else {
 			telegramClient.SendMessage(chatID, targetThreadID, "✅ Plan approved successfully!")
 		}
+		return
+	}
+
+	// Handle Clone callback
+	if strings.HasPrefix(data, "clone:") {
+		sessionIDShort := strings.TrimPrefix(data, "clone:")
+		sessionID := "sessions/" + sessionIDShort
+
+		telegramClient.AnswerCallbackQuery(callbackID, "Cloning task...")
+
+		session, err := julesClient.GetSession(sessionID)
+		if err != nil {
+			telegramClient.SendMessage(chatID, 0, "❌ Failed to retrieve session for cloning.")
+			return
+		}
+
+		cleanTitle := strings.ReplaceAll(session.Title, "\n", " ")
+		runes := []rune(cleanTitle)
+		if len(runes) > 40 {
+			cleanTitle = string(runes[:37]) + "..."
+		}
+		newTitle := cleanTitle + " Cloned"
+
+		newThreadID, err := telegramClient.CreateForumTopic(chatID, newTitle)
+		if err != nil {
+			telegramClient.SendMessage(chatID, 0, "❌ Failed to create cloned topic.")
+			return
+		}
+
+		var fullSource string
+		fullSource = session.SourceContext.Source
+
+		// Since we are in handleCallback, we don't have the `update` object.
+		// But we DO have `messageID` and `chatID`. If we need the `threadID` to fetch the parent config, we can fetch it via the chat context.
+		// Let's just find the thread ID for the original session.
+		var parentThreadID int
+		if chats, err := firestoreClient.GetChatsByChatID(ctx, chatID); err == nil {
+			for _, c := range chats {
+				if c.CurrentSession == sessionID {
+					parentThreadID = c.ThreadID
+					break
+				}
+			}
+		}
+
+		draftBranch := "main"
+		if parentThreadID > 0 {
+			if parentConfig, errConfig := firestoreClient.GetChatConfig(ctx, chatID, parentThreadID); errConfig == nil && parentConfig != nil {
+				if parentConfig.DraftBranch != "" {
+					draftBranch = parentConfig.DraftBranch
+				}
+			}
+		}
+
+		fullSource = session.SourceContext.Source
+
+		// Set new topic state to waiting for title, automatically setting branch
+		// We use SaveChatConfig because this is a brand new topic/document
+		newConfig := firestore.ChatConfig{
+			ChatID:       chatID,
+			ThreadID:     newThreadID,
+			State:        "waiting_for_title",
+			DraftSource:  fullSource,
+			DraftBranch:  draftBranch,
+			CreationMode: "interactive",
+		}
+		if err := firestoreClient.SaveChatConfig(ctx, newConfig); err != nil {
+			log.Printf("Failed to save cloned chat config: %v", err)
+			return
+		}
+
+		var repoPart string
+		sourceParts := strings.Split(fullSource, "/")
+		if len(sourceParts) >= 2 {
+			repoPart = sourceParts[len(sourceParts)-1]
+		} else {
+			repoPart = fullSource
+		}
+
+		var branchButtons [][]telegram.InlineKeyboardButton
+		var currentRow []telegram.InlineKeyboardButton
+
+		var branches []string
+		sources, _ := julesClient.ListSources()
+		for _, s := range sources {
+			if s.Name == fullSource {
+				for _, b := range s.GithubRepo.Branches {
+					branches = append(branches, b.DisplayName)
+				}
+				break
+			}
+		}
+
+		if len(branches) == 0 {
+			branches = []string{"main"}
+		}
+
+		idx := 1
+		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", repoPart, draftBranch)
+		for _, branch := range branches {
+			btnText := fmt.Sprintf("%d", idx)
+			if branch == draftBranch {
+				btnText = "✅ " + btnText
+			}
+			msgBuilder += fmt.Sprintf("%d. %s\n", idx, branch)
+			btn := telegram.InlineKeyboardButton{
+				Text:         btnText,
+				CallbackData: fmt.Sprintf("topicbranch:%d:%s", newThreadID, branch),
+			}
+			currentRow = append(currentRow, btn)
+
+			if len(currentRow) == 5 {
+				branchButtons = append(branchButtons, currentRow)
+				currentRow = nil
+			}
+			idx++
+		}
+		if len(currentRow) > 0 {
+			branchButtons = append(branchButtons, currentRow)
+		}
+
+		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
+
+		// We send this message to the NEW thread
+		telegramClient.SendMessageWithKeyboard(chatID, newThreadID, msgBuilder, keyboard)
+
+		// Also notify in the current thread
+		var currentThreadIDFound int
+		if chats, err := firestoreClient.GetChatsByChatID(ctx, chatID); err == nil {
+			for _, c := range chats {
+				if c.CurrentSession == sessionID {
+					currentThreadIDFound = c.ThreadID
+					break
+				}
+			}
+		}
+
+		telegramClient.SendMessage(chatID, currentThreadIDFound, "✅ Task cloned! Please switch to the new topic to continue.")
 		return
 	}
 
@@ -748,6 +1050,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 					}
 					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
 						{Text: "🔗 Open in Jules", URL: session.URL},
+						{Text: "👯 Clone Task", CallbackData: "clone:" + sessionIDShort},
 					})
 
 					keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
@@ -1080,11 +1383,27 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 		return
 	}
 
+	// Handle setting topic title for cloned tasks
+	if err == nil && chatConfig.State == "waiting_for_title" {
+		if text != "/skip" && threadID > 0 {
+			// Actually telegram API doesn't have an endpoint specifically named `editForumTopic` easily mapped.
+			// It has `editForumTopic` with `chat_id`, `message_thread_id`, `name`.
+			// Let's add EditForumTopic to TelegramClient interface.
+			telegramClient.EditForumTopic(chatID, threadID, text)
+		}
+
+		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_message", chatConfig.DraftSource); err != nil {
+			log.Printf("Failed to update chat state: %v", err)
+		}
+		telegramClient.SendMessage(chatID, threadID, "✅ Title set. Now, please enter the initial message for this new task:")
+		return
+	}
+
 	// Handle creation flow
 	if err == nil && chatConfig.State == "waiting_for_message" {
 		telegramClient.SendMessage(chatID, threadID, "⏳ Creating session on Jules...")
 
-		session, err := julesClient.CreateSession(text, chatConfig.DraftSource, chatConfig.CreationMode)
+		session, err := julesClient.CreateSession(text, chatConfig.DraftSource, chatConfig.CreationMode, chatConfig.DraftBranch)
 		if err != nil {
 			telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("Failed to create session: %v", err))
 			firestoreClient.UpdateChatState(ctx, chatID, threadID, "", "")

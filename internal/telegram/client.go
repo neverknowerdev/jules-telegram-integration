@@ -336,6 +336,32 @@ func (c *Client) SetWebhook(webhookURL string) error {
 	return nil
 }
 
+func (c *Client) EditForumTopic(chatID int64, threadID int, name string) error {
+	url := fmt.Sprintf(BaseURL+"/editForumTopic", c.Token)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"chat_id":           chatID,
+		"message_thread_id": threadID,
+		"name":              name,
+	})
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] EditForumTopic error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 func (c *Client) CreateForumTopic(chatID int64, name string) (int, error) {
 	url := fmt.Sprintf(BaseURL+"/createForumTopic", c.Token)
 

@@ -18,7 +18,24 @@ func setupMocks() (*mocks.MockTelegramClient, *mocks.MockJulesClient, *mocks.Moc
 	tc := &mocks.MockTelegramClient{}
 	jc := &mocks.MockJulesClient{
 		Sources: []jules.Source{
-			{Name: "sources/github/owner/repo1", DisplayName: "owner/repo1", GithubRepo: struct{Owner string `json:"owner"`; Repo string `json:"repo"`}{Owner: "owner", Repo: "repo1"}},
+			{Name: "sources/github/owner/repo1", DisplayName: "owner/repo1", GithubRepo: struct {
+				Owner         string `json:"owner"`
+				Repo          string `json:"repo"`
+				DefaultBranch struct {
+					DisplayName string `json:"displayName"`
+				} `json:"defaultBranch"`
+				Branches []struct {
+					DisplayName string `json:"displayName"`
+				} `json:"branches"`
+			}{
+				Owner: "owner", Repo: "repo1",
+				Branches: []struct {
+					DisplayName string `json:"displayName"`
+				}{
+					{DisplayName: "main"},
+					{DisplayName: "feature/test"},
+				},
+			}},
 		},
 		Sessions: []jules.Session{
 			{Name: "sessions/1", Title: "Fix bug", State: "IN_PROGRESS", SourceContext: struct{Source string `json:"source"`}{Source: "sources/github/owner/repo1"}},
@@ -90,7 +107,7 @@ func TestWebhook_TopicCreated(t *testing.T) {
 	}
 
 	// Verify chat config state changed to waiting_for_repo
-	config := fc.Configs["mock_doc_id"]
+	config := fc.Configs["123_456"]
 	if config == nil || config.State != "waiting_for_repo" {
 		t.Errorf("Expected state 'waiting_for_repo', got %v", config)
 	}
@@ -122,7 +139,7 @@ func TestWebhook_HandleMessage_CreateSession(t *testing.T) {
 	tc, jc, fc := setupMocks()
 
 	// Simulate user selected a repo and is waiting to send prompt
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123"] = &firestore.ChatConfig{
 		ChatID:       123,
 		State:        "waiting_for_message",
 		DraftSource:  "sources/github/owner/repo1",
@@ -143,7 +160,7 @@ func TestWebhook_HandleMessage_CreateSession(t *testing.T) {
 		// Wait, MockJulesClient always returns a mock session on CreateSession
 	}
 
-	config := fc.Configs["mock_doc_id"]
+	config := fc.Configs["123"]
 	if config.CurrentSession != "sessions/mock-created-session" {
 		t.Errorf("Expected current session to be updated, got: %s", config.CurrentSession)
 	}
@@ -160,7 +177,7 @@ func TestWebhook_HandleMessage_CreateSession(t *testing.T) {
 func TestWebhook_Callback_TopicRepo(t *testing.T) {
 	tc, _, fc := setupMocks()
 
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123_456"] = &firestore.ChatConfig{
 		ChatID:   123,
 		ThreadID: 456,
 		State:    "waiting_for_repo",
@@ -183,9 +200,42 @@ func TestWebhook_Callback_TopicRepo(t *testing.T) {
 		t.Errorf("Expected callback query to be answered")
 	}
 
-	config := fc.Configs["mock_doc_id"]
-	if config.State != "waiting_for_message" || config.DraftSource != "sources/github/owner/repo1" {
-		t.Errorf("Expected state waiting_for_message and source repo1, got state=%s source=%s", config.State, config.DraftSource)
+	config := fc.Configs["123_456"]
+	if config.State != "waiting_for_branch" || config.DraftSource != "sources/github/owner/repo1" {
+		t.Errorf("Expected state waiting_for_branch and source repo1, got state=%s source=%s", config.State, config.DraftSource)
+	}
+
+	if len(tc.EditedMessages) == 0 || !strings.Contains(tc.EditedMessages[0], "Select base branch") {
+		t.Errorf("Expected edited message prompting for branch selection")
+	}
+}
+
+func TestWebhook_Callback_TopicBranch(t *testing.T) {
+	tc, _, fc := setupMocks()
+
+	fc.Configs["123_456"] = &firestore.ChatConfig{
+		ChatID:      123,
+		ThreadID:    456,
+		State:       "waiting_for_branch",
+		DraftSource: "sources/github/owner/repo1",
+	}
+
+	update := telegram.Update{
+		CallbackQuery: &telegram.CallbackQuery{
+			ID: "callback2",
+			Message: &telegram.Message{
+				Chat:      &telegram.Chat{ID: 123},
+				MessageID: 789,
+			},
+			Data: "topicbranch:456:feature/test",
+		},
+	}
+
+	sendWebhookRequest(t, update)
+
+	config := fc.Configs["123_456"]
+	if config.State != "waiting_for_message" || config.DraftBranch != "feature/test" {
+		t.Errorf("Expected state waiting_for_message and branch feature/test, got state=%s branch=%s", config.State, config.DraftBranch)
 	}
 
 	if len(tc.EditedMessages) == 0 || !strings.Contains(tc.EditedMessages[0], "Please enter the initial message") {
@@ -193,11 +243,63 @@ func TestWebhook_Callback_TopicRepo(t *testing.T) {
 	}
 }
 
+func TestWebhook_Callback_Clone(t *testing.T) {
+	tc, _, fc := setupMocks()
+
+	// Mock CreateForumTopic returns 999 for thread ID
+	tc.CreateTopicReturnID = 999
+
+	// Make sure we have a session to clone
+	fc.Configs["123_456"] = &firestore.ChatConfig{
+		ChatID:         123,
+		ThreadID:       456,
+		CurrentSession: "sessions/1",
+	}
+
+	update := telegram.Update{
+		CallbackQuery: &telegram.CallbackQuery{
+			ID: "callback_clone",
+			Message: &telegram.Message{
+				Chat:      &telegram.Chat{ID: 123},
+				MessageID: 789,
+			},
+			Data: "clone:1",
+		},
+	}
+
+	sendWebhookRequest(t, update)
+
+	// Should create a new topic
+	if len(tc.CreatedTopics) == 0 || !strings.Contains(tc.CreatedTopics[0], "Cloned") {
+		t.Errorf("Expected new topic to be created with 'Cloned' in title")
+	}
+
+	// State should be waiting_for_title in the NEW document
+	config := fc.Configs["123_999"]
+	if config == nil {
+		t.Fatalf("Expected new config document to be created")
+	}
+	if config.State != "waiting_for_title" {
+		t.Errorf("Expected new topic state waiting_for_title, got %s", config.State)
+	}
+
+	// Should send message to new topic asking for title but providing branch options
+	foundTitlePrompt := false
+	for _, msg := range tc.SentMessages {
+		if strings.Contains(msg, "reply with a new title") {
+			foundTitlePrompt = true
+		}
+	}
+	if !foundTitlePrompt {
+		t.Errorf("Expected branch/title selection message to be sent to new topic")
+	}
+}
+
 func TestWebhook_ApprovePlanCallback_RoutedToCorrectThread(t *testing.T) {
 	tc, _, fc := setupMocks()
 
 	// Create a chat config so GetChatsByChatID finds the right thread
-	fc.Configs["mock_doc_id"] = &firestore.ChatConfig{
+	fc.Configs["123_456"] = &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/1",
