@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	julesClient     *jules.Client
-	firestoreClient *firestore.Client
-	telegramClient  *telegram.Client
+	julesClient     jules.ClientInterface
+	firestoreClient firestore.ClientInterface
+	telegramClient  telegram.ClientInterface
 	projectID       string
 )
 
@@ -45,13 +45,13 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
 	if firestoreClient == nil {
-		var err error
-		firestoreClient, err = firestore.NewClient(ctx, projectID)
+		realFirestoreClient, err := firestore.NewClient(ctx, projectID)
 		if err != nil {
 			log.Printf("Failed to create Firestore client: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+		firestoreClient = realFirestoreClient
 	}
 
 	// 1. Process all chats from Firestore using iterator to save memory
@@ -116,7 +116,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, chat.ThreadID, newestID)
 			return nil
 		}
-
 
 		var hasNewProgress bool = isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
 		progressMsgID := chat.ProgressMessageID

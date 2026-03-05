@@ -17,9 +17,9 @@ import (
 )
 
 var (
-	julesClient     *jules.Client
-	firestoreClient *firestore.Client
-	telegramClient  *telegram.Client
+	julesClient     jules.ClientInterface
+	firestoreClient firestore.ClientInterface
+	telegramClient  telegram.ClientInterface
 	projectID       string
 	selectedSources []string
 )
@@ -61,12 +61,13 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		firestoreClient, err = firestore.NewClient(ctx, projectID)
+		realFirestoreClient, err := firestore.NewClient(ctx, projectID)
 		if err != nil {
 			log.Printf("Failed to create Firestore client: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+		firestoreClient = realFirestoreClient
 	}
 
 	var update telegram.Update
