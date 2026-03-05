@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 var BaseURL = "https://jules.googleapis.com/v1alpha"
@@ -81,12 +82,29 @@ func (c *Client) ListSources() ([]Source, error) {
 	return allSources, nil
 }
 
+type SessionOutput struct {
+	PullRequest *struct {
+		URL     string `json:"url"`
+		Title   string `json:"title"`
+		HeadRef string `json:"headRef"`
+		BaseRef string `json:"baseRef"`
+	} `json:"pullRequest,omitempty"`
+	ChangeSet *struct {
+		Source   string `json:"source"`
+		GitPatch struct {
+			SuggestedCommitMessage string `json:"suggestedCommitMessage"`
+		} `json:"gitPatch"`
+	} `json:"changeSet,omitempty"`
+}
+
 type Session struct {
-	Name          string `json:"name"`
-	Id            string `json:"id"`
-	Title         string `json:"title"`
-	UpdateTime    string `json:"updateTime"`
-	State         string `json:"state"`
+	Name          string          `json:"name"`
+	Id            string          `json:"id"`
+	Title         string          `json:"title"`
+	UpdateTime    string          `json:"updateTime"`
+	State         string          `json:"state"`
+	URL           string          `json:"url"`
+	Outputs       []SessionOutput `json:"outputs,omitempty"`
 	SourceContext struct {
 		Source string `json:"source"`
 	} `json:"sourceContext"`
@@ -140,26 +158,68 @@ func (c *Client) ListSessions() ([]Session, error) {
 	return allSessions, nil
 }
 
+func (c *Client) GetSession(sessionName string) (*Session, error) {
+	if !strings.HasPrefix(sessionName, "sessions/") {
+		sessionName = "sessions/" + sessionName
+	}
+	req, err := http.NewRequest("GET", BaseURL+"/"+sessionName, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Jules API error: %s", string(body))
+	}
+
+	var session Session
+	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
 type Activity struct {
 	Name            string `json:"name"`
 	Id              string `json:"id"`
 	CreateTime      string `json:"createTime"`
 	Originator      string `json:"originator"`
-	ProgressUpdated struct {
+	ProgressUpdated *struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	} `json:"progressUpdated,omitempty"`
-	PlanGenerated struct {
+	PlanGenerated *struct {
 		Plan struct {
+			Id    string `json:"id"`
 			Title string `json:"title"`
+			Steps []struct {
+				Title       string `json:"title"`
+				Description string `json:"description"`
+			} `json:"steps"`
 		} `json:"plan"`
 	} `json:"planGenerated,omitempty"`
-	AgentMessaged struct {
+	AgentMessaged *struct {
 		AgentMessage string `json:"agentMessage"`
 	} `json:"agentMessaged,omitempty"`
-	UserMessaged struct {
+	UserMessaged *struct {
 		UserMessage string `json:"userMessage"`
 	} `json:"userMessaged,omitempty"`
+	SessionCompleted *struct{} `json:"sessionCompleted,omitempty"`
+	SessionFailed    *struct {
+		Reason string `json:"reason"`
+	} `json:"sessionFailed,omitempty"`
+	Artifacts []struct {
+		ChangeSet struct {
+			Source string `json:"source"`
+		} `json:"changeSet"`
+	} `json:"artifacts,omitempty"`
 }
 
 type ListActivitiesResponse struct {
@@ -167,9 +227,10 @@ type ListActivitiesResponse struct {
 	NextPageToken string     `json:"nextPageToken"`
 }
 
-func (c *Client) ListActivities(sessionName string) ([]Activity, error) {
-	var allActivities []Activity
+func (c *Client) ListActivities(sessionName string, sinceID string) ([]Activity, error) {
+	var filteredActivities []Activity
 	pageToken := ""
+	foundSince := false
 
 	// The sessionName is usually "sessions/123", we need to append "/activities"
 	endpoint := fmt.Sprintf("%s/%s/activities", BaseURL, sessionName)
@@ -177,11 +238,11 @@ func (c *Client) ListActivities(sessionName string) ([]Activity, error) {
 	for {
 		u, _ := url.Parse(endpoint)
 		q := u.Query()
-		u.RawQuery = q.Encode() // Reset query
-		q = u.Query()
 		if pageToken != "" {
 			q.Set("pageToken", pageToken)
 		}
+		// Use a very small page size to keep memory peaks low per API call
+		q.Set("pageSize", "10")
 		u.RawQuery = q.Encode()
 
 		req, err := http.NewRequest("GET", u.String(), nil)
@@ -206,13 +267,40 @@ func (c *Client) ListActivities(sessionName string) ([]Activity, error) {
 			return nil, err
 		}
 
-		allActivities = append(allActivities, result.Activities...)
+		if len(result.Activities) > 0 {
+			if sinceID != "" && !foundSince {
+				// Search for sinceID in this page
+				for i, act := range result.Activities {
+					if act.Id == sinceID {
+						foundSince = true
+						// Keep everything AFTER sinceID
+						if i+1 < len(result.Activities) {
+							filteredActivities = append(filteredActivities, result.Activities[i+1:]...)
+						}
+						break
+					}
+				}
+				// If sinceID not found in this page, we don't keep these activities
+				// but we continue to the next page.
+			} else if sinceID != "" && foundSince {
+				// already found sinceID, keep everything in subsequent pages
+				filteredActivities = append(filteredActivities, result.Activities...)
+			} else {
+				// No sinceID provided (first run). Just keep the latest few items.
+				// We keep at most 20 items to have enough for a summary if needed.
+				filteredActivities = append(filteredActivities, result.Activities...)
+				if len(filteredActivities) > 20 {
+					filteredActivities = filteredActivities[len(filteredActivities)-20:]
+				}
+			}
+		}
+
 		pageToken = result.NextPageToken
-		if pageToken == "" {
+		if pageToken == "" || (sinceID != "" && foundSince) {
 			break
 		}
 	}
-	return allActivities, nil
+	return filteredActivities, nil
 }
 
 type SendMessageRequest struct {
@@ -266,18 +354,23 @@ func (c *Client) CreateSession(prompt, source, mode string) (*Session, error) {
 		reqBody.SourceContext = map[string]interface{}{
 			"source": source,
 		}
+		if strings.Contains(source, "github") {
+			reqBody.SourceContext["githubRepoContext"] = map[string]interface{}{
+				"startingBranch": "main",
+			}
+		}
 	}
+
+	// Jules always creates a PR by default for this integration.
+	reqBody.AutomationMode = "AUTO_CREATE_PR"
 
 	if mode == "interactive" {
 		b := true
 		reqBody.RequirePlanApproval = &b
-	} else if mode == "start" || mode == "scheduled" {
+	} else {
+		// start, scheduled, review all default to auto-approved plans.
 		b := false
 		reqBody.RequirePlanApproval = &b
-	} else if mode == "review" {
-		b := false
-		reqBody.RequirePlanApproval = &b
-		reqBody.AutomationMode = "AUTO_CREATE_PR"
 	}
 
 	body, err := json.Marshal(reqBody)

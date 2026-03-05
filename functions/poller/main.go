@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -79,20 +80,17 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		// Update heartbeat
 		firestoreClient.UpdatePollerHeartbeat(ctx, time.Now().Unix())
 
-		chats, err := firestoreClient.GetAllChats(ctx)
-		if err != nil {
-			log.Printf("Failed to get chats: %v", err)
-			break
-		}
-
 		minInteractiveInterval := 999999
+		anyWaitingNow := false
 
-		for _, chat := range chats {
+		// Process all chats from Firestore using iterator to save memory
+		err := firestoreClient.IterateAllChats(ctx, func(chat firestore.ChatConfig) error {
 			if chat.CurrentSession == "" {
-				continue
+				return nil
 			}
 
 			if chat.IsWaitingForJules {
+				anyWaitingNow = true
 				if chat.InteractiveInterval > 0 && chat.InteractiveInterval < minInteractiveInterval {
 					minInteractiveInterval = chat.InteractiveInterval
 				}
@@ -102,34 +100,37 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				standardIntervalSecs := int64(chat.StandardInterval) * 60
 				if chat.LastStandardPoll > 0 && sinceLastPoll < standardIntervalSecs {
 					// Skip this chat until its standard interval has passed
-					continue
+					return nil
 				}
-			}
-
-			activities, err := julesClient.ListActivities(chat.CurrentSession)
-			if err != nil {
-				log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
-				continue
 			}
 
 			if !chat.IsWaitingForJules {
 				firestoreClient.UpdateLastStandardPoll(ctx, chat.ChatID, time.Now().Unix())
 			}
 
-			if len(activities) == 0 {
-				continue
+			log.Printf("[POLLER] Processing chat %d", chat.ChatID)
+
+			// Defer a recover within the loop to catch panics per chat
+			defer func() {
+				if r := recover(); r != nil {
+					errPart := fmt.Sprintf("🚨 <b>Technical Error in Poller</b>\n\n<blockquote>%v</blockquote>", r)
+					if telegramClient != nil {
+						telegramClient.SendMessage(chat.ChatID, errPart)
+					}
+					log.Printf("[POLLER] Panic in chat %d: %v", chat.ChatID, r)
+				}
+			}()
+
+			// Fetch current session details from Jules
+			session, err := julesClient.GetSession(chat.CurrentSession)
+			if err != nil {
+				log.Printf("[POLLER] Chat %d: failed to get session: %v", chat.ChatID, err)
+				return nil
 			}
 
-			absoluteLatest := activities[0]
 			julesWorking := false
-
-			// Determine if the task is currently active/processing based on the absolute latest activity
-			if absoluteLatest.Originator == "user" {
+			if session.State == "IN_PROGRESS" || session.State == "PLANNING" || session.State == "AWAITING_PLAN_APPROVAL" {
 				julesWorking = true
-			} else if absoluteLatest.Originator == "agent" || absoluteLatest.Originator == "system" {
-				if absoluteLatest.ProgressUpdated.Title != "" {
-					julesWorking = true
-				}
 			}
 
 			if chat.IsWaitingForJules && !julesWorking {
@@ -140,87 +141,253 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				// We detected an active task during standard polling. Switch to interactive mode.
 				firestoreClient.UpdateIsWaitingForJules(ctx, chat.ChatID, true)
 				chat.IsWaitingForJules = true
+				anyWaitingNow = true // Mark waiting
 				if chat.InteractiveInterval > 0 && chat.InteractiveInterval < minInteractiveInterval {
 					minInteractiveInterval = chat.InteractiveInterval
 				}
 			}
 
-			var newActivities []jules.Activity
-			foundLast := false
+			// 2. Detect session state transitions (e.g. COMPLETED -> IN_PROGRESS)
+			isTransitioningToActive := (chat.State == "COMPLETED" || chat.State == "FAILED") && julesWorking
 
-			for _, act := range activities {
-				if act.Id == chat.LastActivityID {
-					foundLast = true
+			if isTransitioningToActive {
+				log.Printf("[POLLER] Chat %d: session re-activated (%s -> %s), resetting tracking", chat.ChatID, chat.State, session.State)
+				firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, 0)
+				chat.ProgressMessageID = 0
+			}
+
+			// Update tracked state in Firestore if changed
+			if chat.State != session.State {
+				firestoreClient.UpdateChatState(ctx, chat.ChatID, session.State, chat.DraftSource)
+				chat.State = session.State
+			}
+
+			activities, err := julesClient.ListActivities(chat.CurrentSession, chat.LastActivityID)
+			if err != nil {
+				log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
+				return nil
+			}
+
+			if len(activities) == 0 {
+				return nil
+			}
+
+			log.Printf("[POLLER] Chat %d: fetched %d new activities from Jules", chat.ChatID, len(activities))
+
+			newestID := activities[len(activities)-1].Id
+
+			// First run for this session: just set cursor to newest and skip sending.
+			if chat.LastActivityID == "" {
+				log.Printf("[POLLER] Chat %d: first run, marking newest activity %q and skipping", chat.ChatID, newestID)
+				firestoreClient.UpdateLastActivity(ctx, chat.ChatID, newestID)
+				return nil
+			}
+
+			newActivities := activities
+
+			roundStartIdx := -1
+			for i := len(activities) - 1; i >= 0; i-- {
+				if activities[i].SessionCompleted != nil || activities[i].SessionFailed != nil {
+					roundStartIdx = i
 					break
 				}
-				newActivities = append(newActivities, act)
 			}
 
-			if !foundLast && chat.LastActivityID == "" {
-				if len(activities) > 0 {
-					firestoreClient.UpdateLastActivity(ctx, chat.ChatID, activities[0].Id)
-				}
-				continue
-			}
-
-			if !foundLast && len(newActivities) > 5 {
-				newActivities = newActivities[:5]
-			}
-
-			if len(newActivities) == 0 {
-				continue
-			}
-
-			// Reverse
-			for i, j := 0, len(newActivities)-1; i < j; i, j = i+1, j-1 {
-				newActivities[i], newActivities[j] = newActivities[j], newActivities[i]
-			}
-
-			julesFinished := false
-
-			for _, act := range newActivities {
-				msg := formatActivity(act)
-				if act.PlanGenerated.Plan.Title != "" {
-					sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-					keyboard := telegram.InlineKeyboardMarkup{
-						InlineKeyboard: [][]telegram.InlineKeyboardButton{
-							{
-								{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort},
-							},
-						},
+			isWorkStarted := func(planIdx int) bool {
+				for i := roundStartIdx + 1; i < planIdx; i++ {
+					if activities[i].ProgressUpdated != nil && activities[i].ProgressUpdated.Title != "" {
+						return true
 					}
-					telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
-				} else {
-					telegramClient.SendMessage(chat.ChatID, msg)
-				}
-
-				// Check if Jules is done
-				if act.Originator == "agent" || act.Originator == "system" {
-					if act.ProgressUpdated.Title == "" {
-						// It's not just a progress update, so Jules likely finished (PlanGenerated or AgentMessaged)
-						julesFinished = true
+					if len(activities[i].Artifacts) > 0 {
+						return true
 					}
 				}
+				return false
 			}
+
+			executionPlans := make(map[string]bool)
+			for i, act := range activities {
+				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && isWorkStarted(i) {
+					executionPlans[act.Id] = true
+				}
+			}
+
+			hasNewProgress := isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
+			progressMsgID := chat.ProgressMessageID
 
 			if len(newActivities) > 0 {
-				firestoreClient.UpdateLastActivity(ctx, chat.ChatID, activities[0].Id)
+				for _, act := range newActivities {
+					if act.Originator == "user" {
+						continue
+					}
+
+					if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
+						if executionPlans[act.Id] {
+							hasNewProgress = true
+						} else {
+							log.Printf("[POLLER] Chat %d: sending approval plan", chat.ChatID)
+							progressMsgID = 0
+							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, 0)
+							msg := formatPlan(act)
+							sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+							keyboard := telegram.InlineKeyboardMarkup{
+								InlineKeyboard: [][]telegram.InlineKeyboardButton{
+									{{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort}},
+								},
+							}
+							telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
+						}
+						continue
+					}
+
+					if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
+						msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
+						telegramClient.SendMessage(chat.ChatID, msg)
+						continue
+					}
+
+					if act.SessionFailed != nil {
+						reason := act.SessionFailed.Reason
+						var errMsg string
+						if reason != "" {
+							errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
+						} else {
+							errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
+						}
+						telegramClient.SendMessage(chat.ChatID, errMsg)
+						continue
+					}
+
+					if act.SessionCompleted != nil {
+						msg := formatCompletionMessage(session)
+						sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+						keyboard := telegram.InlineKeyboardMarkup{
+							InlineKeyboard: [][]telegram.InlineKeyboardButton{
+								{
+									{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+									{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+								},
+								{{Text: "🔗 Open in Jules", URL: session.URL}},
+							},
+						}
+						telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
+						continue
+					}
+
+					if (act.ProgressUpdated != nil && act.ProgressUpdated.Title != "") || len(act.Artifacts) > 0 {
+						hasNewProgress = true
+					}
+				}
+				firestoreClient.UpdateLastActivity(ctx, chat.ChatID, newestID)
 			}
 
-			if chat.IsWaitingForJules && julesFinished {
-				firestoreClient.UpdateIsWaitingForJules(ctx, chat.ChatID, false)
-			}
-		}
+			if hasNewProgress {
+				lastApprovedPlanIdx := -1
+				for i := len(activities) - 1; i > roundStartIdx; i-- {
+					if activities[i].PlanGenerated != nil && len(activities[i].PlanGenerated.Plan.Steps) > 0 && !executionPlans[activities[i].Id] {
+						lastApprovedPlanIdx = i
+						break
+					}
+				}
 
-		// Re-fetch chats to see if they are still waiting after processing
-		// to avoid infinite loops when we set IsWaitingForJules to false
-		chatsAfter, _ := firestoreClient.GetAllChats(ctx)
-		anyWaitingNow := false
-		for _, c := range chatsAfter {
-			if c.IsWaitingForJules {
-				anyWaitingNow = true
-				break
+				startIdx := roundStartIdx
+				if lastApprovedPlanIdx > roundStartIdx {
+					startIdx = lastApprovedPlanIdx
+				}
+
+				var allProgressLines []string
+				for i := startIdx + 1; i < len(activities); i++ {
+					act := activities[i]
+					if act.Originator == "user" {
+						continue
+					}
+					ts := formatTimestamp(act.CreateTime)
+					if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && executionPlans[act.Id] {
+						if line := formatExecutionPlanLine(act, ts); line != "" {
+							allProgressLines = append(allProgressLines, line)
+						}
+					} else if line := formatProgressLine(act, ts); line != "" {
+						allProgressLines = append(allProgressLines, line)
+					}
+				}
+
+				if len(allProgressLines) > 15 {
+					allProgressLines = allProgressLines[len(allProgressLines)-15:]
+				}
+
+				if len(allProgressLines) > 0 || progressMsgID == 0 {
+					header := "⚙️ <b>Jules is working on it...</b>\n\n"
+					body := strings.Join(allProgressLines, "\n\n")
+					if body == "" {
+						body = "<i>Jules is thinking...</i>"
+					}
+					msg := header + body
+
+					if progressMsgID == 0 {
+						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
+							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
+							chat.ProgressMessageID = msgID
+						} else {
+							log.Printf("[POLLER] Chat %d: FAILED to create progress message: %v", chat.ChatID, err)
+						}
+					} else {
+						if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
+							log.Printf("[POLLER] Chat %d: edit failed: %v", chat.ChatID, err)
+							if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
+								firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
+								chat.ProgressMessageID = msgID
+							} else {
+								log.Printf("[POLLER] Chat %d: FAILED to create replacement progress message: %v", chat.ChatID, err)
+							}
+						}
+					}
+				}
 			}
+
+			for _, output := range session.Outputs {
+				if output.PullRequest != nil {
+					prURL := output.PullRequest.URL
+					if !chat.NotifiedPRs[prURL] {
+						msg := fmt.Sprintf("🔀 <b>New Pull Request Created!</b>\n\n<b>Title:</b> %s\n<b>Branch:</b> <code>%s</code> → <code>%s</code>",
+							escapeHTML(output.PullRequest.Title), escapeHTML(output.PullRequest.HeadRef), escapeHTML(output.PullRequest.BaseRef))
+						keyboard := telegram.InlineKeyboardMarkup{
+							InlineKeyboard: [][]telegram.InlineKeyboardButton{{{Text: "🔗 View Pull Request", URL: prURL}}},
+						}
+						if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard); err == nil {
+							firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, prURL)
+							if chat.NotifiedPRs == nil {
+								chat.NotifiedPRs = make(map[string]bool)
+							}
+							chat.NotifiedPRs[prURL] = true
+						}
+					}
+				}
+				if output.ChangeSet != nil && output.ChangeSet.Source != "" {
+					source := output.ChangeSet.Source
+					parts := strings.Split(source, "/branches/")
+					if len(parts) > 1 {
+						branchName := parts[1]
+						if !chat.NotifiedBranches[branchName] {
+							msg := fmt.Sprintf("🌿 <b>New GitHub Branch Created!</b>\n\n<b>Branch:</b> <code>%s</code>", escapeHTML(branchName))
+							if err := telegramClient.SendMessage(chat.ChatID, msg); err == nil {
+								firestoreClient.MarkBranchAsNotified(ctx, chat.ChatID, branchName)
+								if chat.NotifiedBranches == nil {
+									chat.NotifiedBranches = make(map[string]bool)
+								}
+								chat.NotifiedBranches[branchName] = true
+							}
+						}
+					}
+				}
+			}
+			runtime.GC()
+			return nil
+		})
+
+		if err != nil {
+			log.Printf("Error iterating chats: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
 		}
 
 		if !anyWaitingNow {
@@ -232,43 +399,137 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			minInteractiveInterval = 5
 		}
 
-		// Sleep for the minimum interactive interval across waiting chats
 		time.Sleep(time.Duration(minInteractiveInterval) * time.Second)
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-func formatActivity(act jules.Activity) string {
-	title := "New Activity"
-	desc := ""
-	if act.ProgressUpdated.Title != "" {
-		title = act.ProgressUpdated.Title
-		desc = act.ProgressUpdated.Description
-	} else if act.PlanGenerated.Plan.Title != "" {
-		title = "Plan Generated"
-		desc = act.PlanGenerated.Plan.Title
-	} else if act.Originator == "user" {
-		title = "You"
-		if act.UserMessaged.UserMessage != "" {
-			desc = formatTelegramHTML(act.UserMessaged.UserMessage)
-		}
-	} else if act.Originator == "agent" {
-		title = "Jules"
-		if act.AgentMessaged.AgentMessage != "" {
-			desc = formatTelegramHTML(act.AgentMessaged.AgentMessage)
-		}
+func formatPlan(act jules.Activity) string {
+	title := "📋 Plan Generated"
+	if act.PlanGenerated == nil {
+		return title
 	}
-
-	// Escape HTML for title safely
-	title = strings.ReplaceAll(title, "&", "&amp;")
-	title = strings.ReplaceAll(title, "<", "&lt;")
-	title = strings.ReplaceAll(title, ">", "&gt;")
-
+	desc := formatTelegramHTML(act.PlanGenerated.Plan.Title)
 	if desc != "" {
-		return fmt.Sprintf("🤖 <b>%s</b>\n%s", title, desc)
+		desc += "\n\n"
 	}
-	return fmt.Sprintf("🤖 <b>%s</b>", title)
+	for i, step := range act.PlanGenerated.Plan.Steps {
+		stepTitle := formatTelegramHTML(step.Title)
+		desc += fmt.Sprintf("<b>%d. %s</b>\n", i+1, stepTitle)
+		if step.Description != "" {
+			cleanDesc := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(step.Description), "-"))
+			desc += fmt.Sprintf("<i>%s</i>\n", formatTelegramHTML(cleanDesc))
+		}
+		desc += "\n"
+	}
+	desc = strings.TrimSpace(desc)
+	return fmt.Sprintf("%s\n%s", title, desc)
+}
+
+func formatAgentMessage(text string) string {
+	// If the message is long, wrap it in an expandable blockquote
+	if len(text) > 200 {
+		preview := text
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		// Use plain text inside blockquote to avoid HTML nesting issues
+		escapedFull := escapeHTML(text)
+		return fmt.Sprintf("💬 <b>Jules</b>\n%s\n<blockquote expandable>%s</blockquote>",
+			formatTelegramHTML(preview), escapedFull)
+	}
+	return fmt.Sprintf("💬 <b>Jules</b>\n%s", formatTelegramHTML(text))
+}
+
+func formatExecutionPlanLine(act jules.Activity, ts string) string {
+	if act.PlanGenerated == nil {
+		return ""
+	}
+	stepCount := len(act.PlanGenerated.Plan.Steps)
+	planTitle := act.PlanGenerated.Plan.Title
+	if planTitle == "" {
+		planTitle = "Updated plan"
+	}
+	planTitle = escapeHTML(planTitle)
+
+	// Build step list as plain text
+	var steps strings.Builder
+	for i, step := range act.PlanGenerated.Plan.Steps {
+		steps.WriteString(fmt.Sprintf("%d. %s\n", i+1, escapeHTML(step.Title)))
+	}
+
+	return fmt.Sprintf("[%s] 📋 <b>%s</b> (%d steps)\n<blockquote expandable>%s</blockquote>",
+		ts, planTitle, stepCount, strings.TrimSpace(steps.String()))
+}
+
+func formatProgressLine(act jules.Activity, ts string) string {
+	if act.ProgressUpdated != nil && act.ProgressUpdated.Title != "" {
+		title := formatTelegramHTML(act.ProgressUpdated.Title)
+		if act.ProgressUpdated.Description != "" {
+			descText := act.ProgressUpdated.Description
+			if len(descText) > 400 {
+				descText = descText[:400] + "..."
+			}
+			if len(descText) > 120 {
+				// Use expandable blockquote — plain text inside to avoid nesting issues
+				return fmt.Sprintf("[%s] ✅ <b>%s</b>\n<blockquote expandable>%s</blockquote>", ts, title, escapeHTML(descText))
+			}
+			desc := formatTelegramHTML(descText)
+			return fmt.Sprintf("[%s] ✅ <b>%s</b>\n<i>%s</i>", ts, title, desc)
+		}
+		return fmt.Sprintf("[%s] ✅ <b>%s</b>", ts, title)
+	}
+
+	if len(act.Artifacts) > 0 {
+		return fmt.Sprintf("[%s] 📝 Working...", ts)
+	}
+
+	return ""
+}
+
+func formatCompletionMessage(session *jules.Session) string {
+	msg := "✅ <b>Jules has completed the task!</b>\n\n"
+
+	// Add commit message from outputs
+	for _, output := range session.Outputs {
+		if output.PullRequest != nil {
+			msg += fmt.Sprintf("🔀 <b>PR created:</b> <a href=\"%s\">%s</a>\n",
+				output.PullRequest.URL, escapeHTML(output.PullRequest.Title))
+		}
+		if output.ChangeSet != nil && output.ChangeSet.GitPatch.SuggestedCommitMessage != "" {
+			commitMsg := output.ChangeSet.GitPatch.SuggestedCommitMessage
+			if len(commitMsg) > 200 {
+				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<blockquote expandable>%s</blockquote>",
+					escapeHTML(commitMsg))
+			} else {
+				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<i>%s</i>", escapeHTML(commitMsg))
+			}
+		}
+	}
+
+	return msg
+}
+
+// escapeHTML escapes &, <, > for use in Telegram HTML without any markdown conversion.
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+func formatTimestamp(createTime string) string {
+	// createTime format: "2026-03-04T20:19:31.780461Z"
+	if len(createTime) >= 16 {
+		return createTime[11:16] // "HH:MM"
+	}
+	return "??:??"
+}
+
+func trimProgressMessage(msg string) string {
+	// Not used anymore due to array slicing. Returning untouched text.
+	return msg
 }
 
 func formatTelegramHTML(md string) string {
@@ -277,13 +538,13 @@ func formatTelegramHTML(md string) string {
 	md = strings.ReplaceAll(md, "<", "&lt;")
 	md = strings.ReplaceAll(md, ">", "&gt;")
 
-	// Markdown to HTML conversions
+	// markdown to HTML conversions
 	// **bold**
-	reBold := regexp.MustCompile(`(?s)\*\*(.*?)\*\*`)
+	reBold := regexp.MustCompile(`\*\*(.*?)\*\*`)
 	md = reBold.ReplaceAllString(md, "<b>$1</b>")
 
 	// *italic*
-	reItalic := regexp.MustCompile(`(?s)\*(.*?)\*`)
+	reItalic := regexp.MustCompile(`\*(.*?)\*`)
 	md = reItalic.ReplaceAllString(md, "<i>$1</i>")
 
 	// ```code block```

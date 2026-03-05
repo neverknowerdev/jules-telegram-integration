@@ -5,12 +5,13 @@ set -e
 
 source local.env
 
+
 echo "Deploying Poller Function to GCP..."
 
 gcloud functions deploy jules-poller \
     --gen2 \
     --region=us-central1 \
-    --runtime=go121 \
+    --runtime=go123 \
     --source=. \
     --entry-point=JulesPoller \
     --trigger-http \
@@ -27,7 +28,7 @@ echo "Deploying Webhook Function to GCP..."
 gcloud functions deploy jules-telegram-webhook \
     --gen2 \
     --region=us-central1 \
-    --runtime=go121 \
+    --runtime=go123 \
     --source=. \
     --entry-point=TelegramWebhook \
     --trigger-http \

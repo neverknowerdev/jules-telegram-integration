@@ -9,17 +9,20 @@ import (
 )
 
 type ChatConfig struct {
-	ChatID              int64  `firestore:"chat_id"`
-	Source              string `firestore:"source"`
-	CurrentSession      string `firestore:"current_session"`
-	LastActivityID      string `firestore:"last_activity_id"`
-	State               string `firestore:"state"`
-	DraftSource         string `firestore:"draft_source"`
-	CreationMode        string `firestore:"creation_mode"`
-	InteractiveInterval int    `firestore:"interactive_interval"` // in seconds
-	StandardInterval    int    `firestore:"standard_interval"`    // in minutes
-	IsWaitingForJules   bool   `firestore:"is_waiting_for_jules"`
-	LastStandardPoll    int64  `firestore:"last_standard_poll"`
+	ChatID              int64           `firestore:"chat_id"`
+	Source              string          `firestore:"source"`
+	CurrentSession      string          `firestore:"current_session"`
+	LastActivityID      string          `firestore:"last_activity_id"`
+	State               string          `firestore:"state"`
+	DraftSource         string          `firestore:"draft_source"`
+	CreationMode        string          `firestore:"creation_mode"`
+	InteractiveInterval int             `firestore:"interactive_interval"` // in seconds
+	StandardInterval    int             `firestore:"standard_interval"`    // in minutes
+	IsWaitingForJules   bool            `firestore:"is_waiting_for_jules"`
+	LastStandardPoll    int64           `firestore:"last_standard_poll"`
+	ProgressMessageID   int             `firestore:"progress_message_id"`
+	NotifiedPRs         map[string]bool `firestore:"notified_prs"`
+	NotifiedBranches    map[string]bool `firestore:"notified_branches"`
 }
 
 type Client struct {
@@ -115,20 +118,41 @@ func (c *Client) UpdateLastActivity(ctx context.Context, chatID int64, activityI
 	return err
 }
 
-func (c *Client) GetAllChats(ctx context.Context) ([]ChatConfig, error) {
-	var chats []ChatConfig
+func (c *Client) UpdateProgressMessageID(ctx context.Context, chatID int64, messageID int) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{Path: "progress_message_id", Value: messageID},
+	})
+	return err
+}
+
+func (c *Client) MarkPRAsNotified(ctx context.Context, chatID int64, prURL string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{FieldPath: firestore.FieldPath{"notified_prs", prURL}, Value: true},
+	})
+	return err
+}
+
+func (c *Client) MarkBranchAsNotified(ctx context.Context, chatID int64, branchName string) error {
+	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+		{FieldPath: firestore.FieldPath{"notified_branches", branchName}, Value: true},
+	})
+	return err
+}
+
+func (c *Client) IterateAllChats(ctx context.Context, fn func(ChatConfig) error) error {
 	iter := c.client.Collection("chats").Documents(ctx)
+	defer iter.Stop()
 	for {
 		doc, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var chat ChatConfig
 		if err := doc.DataTo(&chat); err != nil {
-			return nil, err
+			return err
 		}
 		// Apply defaults
 		if chat.InteractiveInterval <= 0 {
@@ -137,9 +161,12 @@ func (c *Client) GetAllChats(ctx context.Context) ([]ChatConfig, error) {
 		if chat.StandardInterval <= 0 {
 			chat.StandardInterval = 5
 		}
-		chats = append(chats, chat)
+		if err := fn(chat); err != nil {
+			// Log error but continue iterating other chats
+			fmt.Printf("[FIRESTORE] Error in chat callback: %v\n", err)
+		}
 	}
-	return chats, nil
+	return nil
 }
 
 type PollerState struct {
