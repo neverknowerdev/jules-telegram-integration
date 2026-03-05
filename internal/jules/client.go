@@ -303,6 +303,52 @@ func (c *Client) ListActivities(sessionName string, sinceID string) ([]Activity,
 	return filteredActivities, nil
 }
 
+func (c *Client) ListAllActivities(sessionName string) ([]Activity, error) {
+	var allActivities []Activity
+	pageToken := ""
+
+	endpoint := fmt.Sprintf("%s/%s/activities", BaseURL, sessionName)
+
+	for {
+		u, _ := url.Parse(endpoint)
+		q := u.Query()
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		q.Set("pageSize", "100")
+		u.RawQuery = q.Encode()
+
+		req, err := http.NewRequest("GET", u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("Jules API error: %s", string(body))
+		}
+
+		var result ListActivitiesResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, err
+		}
+
+		allActivities = append(allActivities, result.Activities...)
+		pageToken = result.NextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+	return allActivities, nil
+}
+
 type SendMessageRequest struct {
 	Prompt string `json:"prompt"`
 }

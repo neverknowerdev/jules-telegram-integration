@@ -236,6 +236,19 @@ func handleCommand(ctx context.Context, chatID int64, threadID int, text string)
 			return
 		}
 
+		allChats, err := firestoreClient.GetChatsByChatID(ctx, chatID)
+		if err != nil {
+			log.Printf("Failed to get chats by chatID: %v", err)
+			allChats = []firestore.ChatConfig{}
+		}
+
+		sessionToThread := make(map[string]int)
+		for _, c := range allChats {
+			if c.CurrentSession != "" && c.ThreadID > 0 {
+				sessionToThread[c.CurrentSession] = c.ThreadID
+			}
+		}
+
 		chatConfig, _ := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 		currentSession := ""
 		if chatConfig != nil {
@@ -314,10 +327,30 @@ func handleCommand(ctx context.Context, chatID int64, threadID int, text string)
 				if isCurrent {
 					buttonLabel = "⭐ " + buttonLabel
 				}
-				btn := telegram.InlineKeyboardButton{
-					Text:         buttonLabel,
-					CallbackData: "switch:" + sessionIDShort,
+
+				var btn telegram.InlineKeyboardButton
+				if tid, ok := sessionToThread[s.Name]; ok {
+					// In a supergroup, chat ID is usually negative and starts with -100
+					// URL is https://t.me/c/<id_without_-100>/<thread_id>
+					var chatURL string
+					strChatID := fmt.Sprintf("%d", chatID)
+					if strings.HasPrefix(strChatID, "-100") {
+						chatURL = fmt.Sprintf("https://t.me/c/%s/%d", strings.TrimPrefix(strChatID, "-100"), tid)
+					} else {
+						// Fallback if not a standard supergroup ID
+						chatURL = fmt.Sprintf("https://t.me/c/%s/%d", strings.TrimPrefix(strChatID, "-"), tid)
+					}
+					btn = telegram.InlineKeyboardButton{
+						Text: buttonLabel,
+						URL:  chatURL,
+					}
+				} else {
+					btn = telegram.InlineKeyboardButton{
+						Text:         buttonLabel,
+						CallbackData: "createtopic:" + sessionIDShort,
+					}
 				}
+
 				// Group 5 buttons per row
 				rowIdx := (num - 1) / 5
 				for len(buttons) <= rowIdx {
@@ -607,6 +640,97 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		return
 	}
 
+	// Handle Create Topic callback
+	if strings.HasPrefix(data, "createtopic:") {
+		sessionIDShort := strings.TrimPrefix(data, "createtopic:")
+		sessionID := "sessions/" + sessionIDShort
+
+		telegramClient.AnswerCallbackQuery(callbackID, "Creating topic and syncing history...")
+
+		session, err := julesClient.GetSession(sessionID)
+		if err != nil {
+			log.Printf("Failed to get session: %v", err)
+			telegramClient.SendMessage(chatID, 0, "❌ Failed to retrieve session.")
+			return
+		}
+
+		cleanTitle := strings.ReplaceAll(session.Title, "\n", " ")
+		runes := []rune(cleanTitle)
+		if len(runes) > 50 {
+			cleanTitle = string(runes[:47]) + "..."
+		}
+		if cleanTitle == "" {
+			cleanTitle = "Imported Task"
+		}
+
+		newThreadID, err := telegramClient.CreateForumTopic(chatID, cleanTitle)
+		if err != nil {
+			log.Printf("Failed to create topic: %v", err)
+			telegramClient.SendMessage(chatID, 0, "❌ Failed to create topic. Make sure the bot is an admin with 'Manage Topics' permission.")
+			return
+		}
+
+		// Bind this topic to the session
+		config := firestore.ChatConfig{
+			ChatID:         chatID,
+			ThreadID:       newThreadID,
+			State:          session.State,
+			CurrentSession: sessionID,
+			DraftSource:    session.SourceContext.Source,
+		}
+		if err := firestoreClient.SaveChatConfig(ctx, config); err != nil {
+			log.Printf("Failed to save chat config for created topic: %v", err)
+		}
+
+		// Fetch complete history
+		activities, err := julesClient.ListAllActivities(sessionID)
+		if err != nil {
+			log.Printf("Failed to fetch activities: %v", err)
+			telegramClient.SendMessage(chatID, newThreadID, "❌ Failed to fetch session history.")
+		} else {
+			// Reverse activities to chronological order
+			for i := 0; i < len(activities)/2; i++ {
+				j := len(activities) - i - 1
+				activities[i], activities[j] = activities[j], activities[i]
+			}
+
+			// Post history
+			for _, act := range activities {
+				if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
+					msg := fmt.Sprintf("👤 <b>User</b>\n%s", formatTelegramHTML(act.UserMessaged.UserMessage))
+					telegramClient.SendMessage(chatID, newThreadID, msg)
+				} else if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
+					msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
+					telegramClient.SendMessage(chatID, newThreadID, msg)
+				} else if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
+					msg := formatPlan(act)
+					telegramClient.SendMessage(chatID, newThreadID, msg)
+				} else if act.SessionCompleted != nil {
+					msg := formatCompletionMessage(session)
+					telegramClient.SendMessage(chatID, newThreadID, msg)
+				} else if act.SessionFailed != nil {
+					reason := act.SessionFailed.Reason
+					var errMsg string
+					if reason != "" {
+						errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
+					} else {
+						errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
+					}
+					telegramClient.SendMessage(chatID, newThreadID, errMsg)
+				}
+			}
+		}
+
+		telegramClient.SendMessage(chatID, newThreadID, "✅ <b>History Sync Complete!</b> You can now continue this task here.")
+
+		// Note: The inline keyboard from the `/tasks` command cannot be easily fully re-rendered without a ton of state,
+		// but the user can just re-send `/tasks` to see the updated link.
+		// For UX, we could edit the original message if we generated it, but `messageID` refers to the inline keyboard message.
+		telegramClient.EditMessageText(chatID, messageID, "✅ Topic created and history synced! Please request /tasks again to see the updated link.", nil)
+
+		return
+	}
+
 	// Handle Create Branch callback
 	if strings.HasPrefix(data, "create_branch:") {
 		sessionIDShort := strings.TrimPrefix(data, "create_branch:")
@@ -691,6 +815,63 @@ func relativeTime(t time.Time) string {
 		return fmt.Sprintf("%d hrs ago", int(diff.Hours()))
 	}
 	return fmt.Sprintf("%d days ago", int(diff.Hours()/24))
+}
+
+func formatPlan(act jules.Activity) string {
+	title := "📋 Plan Generated"
+	if act.PlanGenerated == nil {
+		return title
+	}
+	desc := formatTelegramHTML(act.PlanGenerated.Plan.Title)
+	if desc != "" {
+		desc += "\n\n"
+	}
+	for i, step := range act.PlanGenerated.Plan.Steps {
+		stepTitle := formatTelegramHTML(step.Title)
+		desc += fmt.Sprintf("<b>%d. %s</b>\n", i+1, stepTitle)
+		if step.Description != "" {
+			cleanDesc := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(step.Description), "-"))
+			desc += fmt.Sprintf("<i>%s</i>\n", formatTelegramHTML(cleanDesc))
+		}
+		desc += "\n"
+	}
+	desc = strings.TrimSpace(desc)
+	return fmt.Sprintf("%s\n%s", title, desc)
+}
+
+func formatAgentMessage(text string) string {
+	if len(text) > 200 {
+		preview := text
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		escapedFull := escapeHTML(text)
+		return fmt.Sprintf("💬 <b>Jules</b>\n%s\n<blockquote expandable>%s</blockquote>",
+			formatTelegramHTML(preview), escapedFull)
+	}
+	return fmt.Sprintf("💬 <b>Jules</b>\n%s", formatTelegramHTML(text))
+}
+
+func formatCompletionMessage(session *jules.Session) string {
+	msg := "✅ <b>Jules has completed the task!</b>\n\n"
+
+	for _, output := range session.Outputs {
+		if output.PullRequest != nil {
+			msg += fmt.Sprintf("🔀 <b>PR created:</b> <a href=\"%s\">%s</a>\n",
+				output.PullRequest.URL, escapeHTML(output.PullRequest.Title))
+		}
+		if output.ChangeSet != nil && output.ChangeSet.GitPatch.SuggestedCommitMessage != "" {
+			commitMsg := output.ChangeSet.GitPatch.SuggestedCommitMessage
+			if len(commitMsg) > 200 {
+				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<blockquote expandable>%s</blockquote>",
+					escapeHTML(commitMsg))
+			} else {
+				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<i>%s</i>", escapeHTML(commitMsg))
+			}
+		}
+	}
+
+	return msg
 }
 
 func formatActivity(act jules.Activity) string {

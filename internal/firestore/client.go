@@ -64,6 +64,28 @@ func (c *Client) GetChatConfig(ctx context.Context, chatID int64, threadID int) 
 	return &config, nil
 }
 
+func (c *Client) GetChatsByChatID(ctx context.Context, chatID int64) ([]ChatConfig, error) {
+	iter := c.client.Collection("chats").Where("chat_id", "==", chatID).Documents(ctx)
+	defer iter.Stop()
+
+	var chats []ChatConfig
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var chat ChatConfig
+		if err := doc.DataTo(&chat); err != nil {
+			return nil, err
+		}
+		chats = append(chats, chat)
+	}
+	return chats, nil
+}
+
 func (c *Client) DeleteChatConfig(ctx context.Context, chatID int64, threadID int) error {
 	docID := c.getDocID(chatID, threadID)
 	_, err := c.client.Collection("chats").Doc(docID).Delete(ctx)
