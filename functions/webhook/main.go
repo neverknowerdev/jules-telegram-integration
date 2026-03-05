@@ -509,7 +509,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 	}
 
 	// Acknowledge the press so the spinner disappears
-	log.Printf("[WEBHOOK] Callback received: id=%s data=%s", callbackID, data)
 	telegramClient.AnswerCallbackQuery(callbackID, "Switching...")
 
 	// Handle topic repo selection callback
@@ -526,10 +525,8 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 
 		// Need to find full source URL
 		var fullSource string
-		log.Printf("[WEBHOOK] Fetching sources to identify repo: %s", repoName)
 		sources, err := julesClient.ListSourcesSummary()
 		if err == nil {
-			log.Printf("[WEBHOOK] Found %d source summaries", len(sources))
 			for _, s := range sources {
 				if s.GithubRepo.Repo == repoName || s.DisplayName == repoName {
 					fullSource = s.Name
@@ -539,19 +536,15 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		if fullSource == "" {
-			log.Printf("[WEBHOOK] Could not find full source for repo: %s", repoName)
 			telegramClient.SendMessage(chatID, threadID, "Could not identify the repository.")
 			return
 		}
-		log.Printf("[WEBHOOK] Identified full source: %s. Fetching branches...", fullSource)
 
-		log.Printf("[WEBHOOK] Updating chat state for %d", threadID)
 		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_branch", fullSource); err != nil {
 			log.Printf("[WEBHOOK] Failed to update chat state: %v", err)
 			telegramClient.SendMessage(chatID, threadID, "An error occurred updating the task state.")
 			return
 		}
-		log.Printf("[WEBHOOK] Chat state updated. Building keyboard...")
 
 		source, err := julesClient.GetSource(fullSource)
 		if err != nil {
@@ -597,8 +590,6 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
-		log.Printf("[WEBHOOK] Final msg target messageID: %d, chatID: %d, threadID: %d", messageID, chatID, threadID)
-		log.Printf("[WEBHOOK] Final msgBuilder text length: %d", len(msgBuilder))
 		if err := telegramClient.EditMessageText(chatID, messageID, msgBuilder, &keyboard); err != nil {
 			log.Printf("[WEBHOOK] Failed to edit message: %v", err)
 			// fallback to sending new message if edit fails
@@ -924,6 +915,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 
 		newThreadID, err := telegramClient.CreateForumTopic(chatID, newTitle)
 		if err != nil {
+			log.Printf("Failed to create cloned topic: %v", err)
 			telegramClient.SendMessage(chatID, 0, "❌ Failed to create cloned topic.")
 			return
 		}

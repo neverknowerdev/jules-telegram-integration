@@ -309,9 +309,7 @@ func (c *Client) EditMessageText(chatID int64, messageID int, text string, keybo
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[TELEGRAM] editMessageText error: status=%d body=%s", resp.StatusCode, string(respBody))
-		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
 	}
 
 	return nil

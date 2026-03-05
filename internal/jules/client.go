@@ -151,7 +151,6 @@ func (c *Client) GetSource(sourceName string) (*Source, error) {
 		sourceName = "sources/" + sourceName
 	}
 	url := BaseURL + "/" + sourceName
-	log.Printf("[JULES] GetSource: %s", url)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -160,7 +159,6 @@ func (c *Client) GetSource(sourceName string) (*Source, error) {
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		log.Printf("[JULES] GetSource HTTP error: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -172,12 +170,9 @@ func (c *Client) GetSource(sourceName string) (*Source, error) {
 	}
 
 	var source Source
-	log.Printf("[JULES] Decoding source JSON...")
 	if err := json.NewDecoder(resp.Body).Decode(&source); err != nil {
-		log.Printf("[JULES] Failed to decode source: %v", err)
 		return nil, err
 	}
-	log.Printf("[JULES] GetSource success: %s (%d branches)", source.Name, len(source.GithubRepo.Branches))
 	return &source, nil
 }
 
