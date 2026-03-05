@@ -10,6 +10,7 @@ import (
 
 type ChatConfig struct {
 	ChatID            int64           `firestore:"chat_id"`
+	ThreadID          int             `firestore:"thread_id"`
 	Source            string          `firestore:"source"`
 	CurrentSession    string          `firestore:"current_session"`
 	LastActivityID    string          `firestore:"last_activity_id"`
@@ -37,13 +38,22 @@ func (c *Client) Close() error {
 	return c.client.Close()
 }
 
+func (c *Client) getDocID(chatID int64, threadID int) string {
+	if threadID > 0 {
+		return fmt.Sprintf("%d_%d", chatID, threadID)
+	}
+	return fmt.Sprintf("%d", chatID)
+}
+
 func (c *Client) SaveChatConfig(ctx context.Context, config ChatConfig) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", config.ChatID)).Set(ctx, config)
+	docID := c.getDocID(config.ChatID, config.ThreadID)
+	_, err := c.client.Collection("chats").Doc(docID).Set(ctx, config)
 	return err
 }
 
-func (c *Client) GetChatConfig(ctx context.Context, chatID int64) (*ChatConfig, error) {
-	doc, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Get(ctx)
+func (c *Client) GetChatConfig(ctx context.Context, chatID int64, threadID int) (*ChatConfig, error) {
+	docID := c.getDocID(chatID, threadID)
+	doc, err := c.client.Collection("chats").Doc(docID).Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -54,51 +64,64 @@ func (c *Client) GetChatConfig(ctx context.Context, chatID int64) (*ChatConfig, 
 	return &config, nil
 }
 
-func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, sessionID string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) DeleteChatConfig(ctx context.Context, chatID int64, threadID int) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Delete(ctx)
+	return err
+}
+
+func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, threadID int, sessionID string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "current_session", Value: sessionID},
 	})
 	return err
 }
 
-func (c *Client) UpdateChatState(ctx context.Context, chatID int64, state, draftSource string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) UpdateChatState(ctx context.Context, chatID int64, threadID int, state, draftSource string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "state", Value: state},
 		{Path: "draft_source", Value: draftSource},
 	})
 	return err
 }
 
-func (c *Client) UpdateCreationMode(ctx context.Context, chatID int64, mode string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) UpdateCreationMode(ctx context.Context, chatID int64, threadID int, mode string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "creation_mode", Value: mode},
 	})
 	return err
 }
 
-func (c *Client) UpdateLastActivity(ctx context.Context, chatID int64, activityID string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) UpdateLastActivity(ctx context.Context, chatID int64, threadID int, activityID string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "last_activity_id", Value: activityID},
 	})
 	return err
 }
 
-func (c *Client) UpdateProgressMessageID(ctx context.Context, chatID int64, messageID int) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) UpdateProgressMessageID(ctx context.Context, chatID int64, threadID int, messageID int) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "progress_message_id", Value: messageID},
 	})
 	return err
 }
 
-func (c *Client) MarkPRAsNotified(ctx context.Context, chatID int64, prURL string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) MarkPRAsNotified(ctx context.Context, chatID int64, threadID int, prURL string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{FieldPath: firestore.FieldPath{"notified_prs", prURL}, Value: true},
 	})
 	return err
 }
 
-func (c *Client) MarkBranchAsNotified(ctx context.Context, chatID int64, branchName string) error {
-	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
+func (c *Client) MarkBranchAsNotified(ctx context.Context, chatID int64, threadID int, branchName string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{FieldPath: firestore.FieldPath{"notified_branches", branchName}, Value: true},
 	})
 	return err

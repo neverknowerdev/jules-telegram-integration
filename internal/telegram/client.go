@@ -31,8 +31,11 @@ type Update struct {
 
 type Message struct {
 	MessageID int    `json:"message_id"`
+	MessageThreadID int `json:"message_thread_id,omitempty"`
 	From      *User  `json:"from"`
 	Chat      *Chat  `json:"chat"`
+	IsTopicMessage bool `json:"is_topic_message,omitempty"`
+	ForumTopicCreated *ForumTopicCreated `json:"forum_topic_created,omitempty"`
 	Text      string `json:"text"`
 }
 
@@ -77,14 +80,19 @@ type ReplyKeyboardMarkup struct {
 	IsPersistent    bool               `json:"is_persistent"`
 }
 
-func (c *Client) SendMessage(chatID int64, text string) error {
+func (c *Client) SendMessage(chatID int64, threadID int, text string) error {
 	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
 
-	body, err := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "HTML",
-	})
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -105,14 +113,19 @@ func (c *Client) SendMessage(chatID int64, text string) error {
 }
 
 // SendMessageReturningID sends a message and returns the Telegram message_id.
-func (c *Client) SendMessageReturningID(chatID int64, text string) (int, error) {
+func (c *Client) SendMessageReturningID(chatID int64, threadID int, text string) (int, error) {
 	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
 
-	body, err := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "HTML",
-	})
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
 	}
@@ -140,15 +153,20 @@ func (c *Client) SendMessageReturningID(chatID int64, text string) (int, error) 
 	return result.Result.MessageID, nil
 }
 
-func (c *Client) SendMessageWithKeyboard(chatID int64, text string, keyboard InlineKeyboardMarkup) error {
+func (c *Client) SendMessageWithKeyboard(chatID int64, threadID int, text string, keyboard InlineKeyboardMarkup) error {
 	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
 
-	body, err := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"chat_id":      chatID,
 		"text":         text,
 		"parse_mode":   "HTML",
 		"reply_markup": keyboard,
-	})
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -168,15 +186,20 @@ func (c *Client) SendMessageWithKeyboard(chatID int64, text string, keyboard Inl
 	return nil
 }
 
-func (c *Client) SendMessageWithReplyKeyboard(chatID int64, text string, keyboard ReplyKeyboardMarkup) error {
+func (c *Client) SendMessageWithReplyKeyboard(chatID int64, threadID int, text string, keyboard ReplyKeyboardMarkup) error {
 	url := fmt.Sprintf(BaseURL+"/sendMessage", c.Token)
 
-	body, err := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"chat_id":      chatID,
 		"text":         text,
 		"parse_mode":   "HTML",
 		"reply_markup": keyboard,
-	})
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -269,4 +292,35 @@ func (c *Client) SetWebhook(webhookURL string) error {
 		return fmt.Errorf("telegram API error: %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c *Client) DeleteForumTopic(chatID int64, threadID int) error {
+	url := fmt.Sprintf(BaseURL+"/deleteForumTopic", c.Token)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"chat_id":           chatID,
+		"message_thread_id": threadID,
+	})
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTP.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TELEGRAM] DeleteForumTopic error: status=%d body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error: %d %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+type ForumTopicCreated struct {
+	Name              string `json:"name"`
+	IconColor         int    `json:"icon_color"`
+	IconCustomEmojiID string `json:"icon_custom_emoji_id,omitempty"`
 }

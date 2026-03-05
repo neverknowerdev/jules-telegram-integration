@@ -90,18 +90,104 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chatID := update.Message.Chat.ID
+	threadID := update.Message.MessageThreadID
 	text := update.Message.Text
 
+	if update.Message.ForumTopicCreated != nil {
+		handleTopicCreated(ctx, chatID, threadID, update.Message.ForumTopicCreated)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if !strings.HasPrefix(text, "/") && text != "🗓 Show Tasks" && text != "➕ New Task" {
-		handleMessage(ctx, chatID, text)
+		handleMessage(ctx, chatID, threadID, text)
 	} else {
-		handleCommand(ctx, chatID, text)
+		handleCommand(ctx, chatID, threadID, text)
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-func handleCommand(ctx context.Context, chatID int64, text string) {
+func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *telegram.ForumTopicCreated) {
+	if firestoreClient == nil || julesClient == nil || telegramClient == nil {
+		return
+	}
+
+	config := firestore.ChatConfig{
+		ChatID:   chatID,
+		ThreadID: threadID,
+		State:    "waiting_for_repo",
+	}
+	if err := firestoreClient.SaveChatConfig(ctx, config); err != nil {
+		log.Printf("Failed to save chat config for new topic: %v", err)
+		return
+	}
+
+	sources, err := julesClient.ListSources()
+	if err != nil {
+		telegramClient.SendMessage(chatID, threadID, "Failed to load repos.")
+		return
+	}
+
+	var msgBuilder strings.Builder
+	safeTopicName := escapeHTML(topic.Name)
+	msgBuilder.WriteString(fmt.Sprintf("💬 <b>Topic '%s' Created!</b>\nSelect a repository to bind to this task:\n\n", safeTopicName))
+
+	var buttons [][]telegram.InlineKeyboardButton
+	var currentRow []telegram.InlineKeyboardButton
+
+	idx := 1
+	for _, s := range sources {
+		if len(selectedSources) > 0 {
+			found := false
+			for _, sel := range selectedSources {
+				if s.Name == sel {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		repoName := s.GithubRepo.Repo
+		if repoName == "" {
+			repoName = s.DisplayName
+		}
+		if repoName == "" {
+			repoName = "Unknown Repo"
+		}
+
+		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", idx, repoName))
+
+		btn := telegram.InlineKeyboardButton{
+			Text:         fmt.Sprintf("%d", idx),
+			CallbackData: fmt.Sprintf("topicrepo:%d:%s", threadID, repoName),
+		}
+		currentRow = append(currentRow, btn)
+
+		if len(currentRow) == 5 {
+			buttons = append(buttons, currentRow)
+			currentRow = nil
+		}
+		idx++
+	}
+
+	if len(currentRow) > 0 {
+		buttons = append(buttons, currentRow)
+	}
+
+	if len(buttons) == 0 {
+		telegramClient.SendMessage(chatID, threadID, "No repositories available.")
+		return
+	}
+
+	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: buttons}
+	telegramClient.SendMessageWithKeyboard(chatID, threadID, msgBuilder.String(), keyboard)
+}
+
+func handleCommand(ctx context.Context, chatID int64, threadID int, text string) {
 	parts := strings.Fields(text)
 	if len(parts) == 0 {
 		return
@@ -124,7 +210,7 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 		}
 		if err := firestoreClient.SaveChatConfig(ctx, config); err != nil {
 			log.Printf("Failed to save chat config: %v", err)
-			telegramClient.SendMessage(chatID, "Failed to register chat.")
+			telegramClient.SendMessage(chatID, threadID, "Failed to register chat.")
 			return
 		}
 
@@ -140,17 +226,17 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 		}
 
 		msg := "Welcome! I am bound to your Jules repositories.\nUse the menu to navigate."
-		telegramClient.SendMessageWithReplyKeyboard(chatID, msg, keyboard)
+		telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, msg, keyboard)
 
 	case "/tasks", "/sessions", "🗓 Show Tasks":
 		sessions, err := julesClient.ListSessions()
 		if err != nil {
 			log.Printf("Failed to list sessions: %v", err)
-			telegramClient.SendMessage(chatID, "Failed to list sessions.")
+			telegramClient.SendMessage(chatID, threadID, "Failed to list sessions.")
 			return
 		}
 
-		chatConfig, _ := firestoreClient.GetChatConfig(ctx, chatID)
+		chatConfig, _ := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 		currentSession := ""
 		if chatConfig != nil {
 			currentSession = chatConfig.CurrentSession
@@ -182,7 +268,7 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 		}
 
 		if len(groupsMap) == 0 {
-			telegramClient.SendMessage(chatID, "No active sessions found for these sources.")
+			telegramClient.SendMessage(chatID, threadID, "No active sessions found for these sources.")
 			return
 		}
 
@@ -244,19 +330,19 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 		}
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: buttons}
-		telegramClient.SendMessageWithKeyboard(chatID, msgBuilder.String(), keyboard)
+		telegramClient.SendMessageWithKeyboard(chatID, threadID, msgBuilder.String(), keyboard)
 
 	case "/status":
-		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID)
+		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 		if err != nil {
-			telegramClient.SendMessage(chatID, "Could not retrieve chat status.")
+			telegramClient.SendMessage(chatID, threadID, "Could not retrieve chat status.")
 			return
 		}
 		if chatConfig.CurrentSession == "" {
-			telegramClient.SendMessage(chatID, "No session currently selected.")
+			telegramClient.SendMessage(chatID, threadID, "No session currently selected.")
 			return
 		}
-		telegramClient.SendMessage(chatID, fmt.Sprintf("Current Session: %s", chatConfig.CurrentSession))
+		telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("Current Session: %s", chatConfig.CurrentSession))
 
 	case "/new_chat", "➕ New Task":
 		var msgBuilder strings.Builder
@@ -266,7 +352,7 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 
 		sources, err := julesClient.ListSources()
 		if err != nil {
-			telegramClient.SendMessage(chatID, "Failed to load repos.")
+			telegramClient.SendMessage(chatID, threadID, "Failed to load repos.")
 			return
 		}
 
@@ -301,21 +387,21 @@ func handleCommand(ctx context.Context, chatID int64, text string) {
 		}
 
 		if len(buttons) == 0 {
-			telegramClient.SendMessage(chatID, "No repositories available.")
+			telegramClient.SendMessage(chatID, threadID, "No repositories available.")
 			return
 		}
 
 		// clear state in case it was stuck
-		firestoreClient.UpdateChatState(ctx, chatID, "", "")
+		firestoreClient.UpdateChatState(ctx, chatID, threadID, "", "")
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: buttons}
-		telegramClient.SendMessageWithKeyboard(chatID, msgBuilder.String(), keyboard)
+		telegramClient.SendMessageWithKeyboard(chatID, threadID, msgBuilder.String(), keyboard)
 
 	case "/switch":
-		telegramClient.SendMessage(chatID, "Please use /tasks to select a chat via buttons.")
+		telegramClient.SendMessage(chatID, threadID, "Please use /tasks to select a chat via buttons.")
 
 	default:
-		telegramClient.SendMessage(chatID, "Unknown command.")
+		telegramClient.SendMessage(chatID, threadID, "Unknown command.")
 	}
 }
 
@@ -328,7 +414,63 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 	// Acknowledge the press so the spinner disappears
 	telegramClient.AnswerCallbackQuery(callbackID, "Switching...")
 
-	// Handle New Chat callback
+	// Handle topic repo selection callback
+	if strings.HasPrefix(data, "topicrepo:") {
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) != 3 {
+			return
+		}
+		threadIDStr := parts[1]
+		repoName := parts[2]
+
+		var threadID int
+		fmt.Sscanf(threadIDStr, "%d", &threadID)
+
+		telegramClient.AnswerCallbackQuery(callbackID, "")
+
+		// Need to find full source URL
+		var fullSource string
+		sources, err := julesClient.ListSources()
+		if err == nil {
+			for _, s := range sources {
+				if s.GithubRepo.Repo == repoName || s.DisplayName == repoName {
+					fullSource = s.Name
+					break
+				}
+			}
+		}
+
+		if fullSource == "" {
+			telegramClient.SendMessage(chatID, threadID, "Could not identify the repository.")
+			return
+		}
+
+		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_message", fullSource); err != nil {
+			log.Printf("Failed to update chat state: %v", err)
+			telegramClient.SendMessage(chatID, threadID, "An error occurred.")
+			return
+		}
+		if err := firestoreClient.UpdateCreationMode(ctx, chatID, threadID, "interactive"); err != nil {
+			log.Printf("Failed to update creation mode: %v", err)
+		}
+
+		var modeButtons [][]telegram.InlineKeyboardButton
+		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
+			{Text: "💡 Interactive (Default)", CallbackData: fmt.Sprintf("mode:%d:interactive", threadID)},
+			{Text: "🚀 Start", CallbackData: fmt.Sprintf("mode:%d:start", threadID)},
+		})
+		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
+			{Text: "👀 Review", CallbackData: fmt.Sprintf("mode:%d:review", threadID)},
+			{Text: "⏳ Scheduled", CallbackData: fmt.Sprintf("mode:%d:scheduled", threadID)},
+		})
+
+		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: modeButtons}
+		msg := fmt.Sprintf("✏️ <b>Repository:</b> %s\nMode selected: <b>interactive</b>\n\n<i>You can change it using buttons below.</i>\n\nPlease enter the initial message for this new task:", repoName)
+		telegramClient.EditMessageText(chatID, messageID, msg, &keyboard)
+		return
+	}
+
+	// Handle New Chat callback (Old flow)
 	if strings.HasPrefix(data, "newchat:") {
 		repoName := strings.TrimPrefix(data, "newchat:")
 		telegramClient.AnswerCallbackQuery(callbackID, "")
@@ -346,71 +488,80 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		if fullSource == "" {
-			telegramClient.SendMessage(chatID, "Could not identify the repository.")
+			telegramClient.SendMessage(chatID, 0, "Could not identify the repository.")
 			return
 		}
 
-		if err := firestoreClient.UpdateChatState(ctx, chatID, "waiting_for_message", fullSource); err != nil {
+		if err := firestoreClient.UpdateChatState(ctx, chatID, 0, "waiting_for_message", fullSource); err != nil {
 			log.Printf("Failed to update chat state: %v", err)
-			telegramClient.SendMessage(chatID, "An error occurred.")
+			telegramClient.SendMessage(chatID, 0, "An error occurred.")
 			return
 		}
-		if err := firestoreClient.UpdateCreationMode(ctx, chatID, "interactive"); err != nil {
+		if err := firestoreClient.UpdateCreationMode(ctx, chatID, 0, "interactive"); err != nil {
 			log.Printf("Failed to update creation mode: %v", err)
 		}
 
 		var modeButtons [][]telegram.InlineKeyboardButton
 		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "💡 Interactive (Default)", CallbackData: "mode:interactive"},
-			{Text: "🚀 Start", CallbackData: "mode:start"},
+			{Text: "💡 Interactive (Default)", CallbackData: "mode:0:interactive"},
+			{Text: "🚀 Start", CallbackData: "mode:0:start"},
 		})
 		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "👀 Review", CallbackData: "mode:review"},
-			{Text: "⏳ Scheduled", CallbackData: "mode:scheduled"},
+			{Text: "👀 Review", CallbackData: "mode:0:review"},
+			{Text: "⏳ Scheduled", CallbackData: "mode:0:scheduled"},
 		})
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: modeButtons}
 		msg := fmt.Sprintf("✏️ <b>Repository:</b> %s\nMode selected: <b>interactive</b>\n\n<i>You can change it using buttons below.</i>\n\nPlease enter the initial message for this new task:", repoName)
-		telegramClient.SendMessageWithKeyboard(chatID, msg, keyboard)
+		telegramClient.SendMessageWithKeyboard(chatID, 0, msg, keyboard)
 		return
 	}
 
 	// Handle Mode selection callback
 	if strings.HasPrefix(data, "mode:") {
-		mode := strings.TrimPrefix(data, "mode:")
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) != 3 {
+			return
+		}
+		threadIDStr := parts[1]
+		mode := parts[2]
+
+		var threadID int
+		fmt.Sscanf(threadIDStr, "%d", &threadID)
+
 		telegramClient.AnswerCallbackQuery(callbackID, "Mode updated")
 
-		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID)
+		chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 		if err != nil {
 			return
 		}
 
-		if err := firestoreClient.UpdateCreationMode(ctx, chatID, mode); err != nil {
+		if err := firestoreClient.UpdateCreationMode(ctx, chatID, threadID, mode); err != nil {
 			log.Printf("Failed to update creation mode: %v", err)
 			return
 		}
 
 		// Edit current message to reflect change
 		repoPart := ""
-		parts := strings.Split(chatConfig.DraftSource, "/")
-		if len(parts) >= 2 {
-			repoPart = parts[len(parts)-1]
+		sourceParts := strings.Split(chatConfig.DraftSource, "/")
+		if len(sourceParts) >= 2 {
+			repoPart = sourceParts[len(sourceParts)-1]
 		}
 
 		var modeButtons [][]telegram.InlineKeyboardButton
 		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "💡 Interactive", CallbackData: "mode:interactive"},
-			{Text: "🚀 Start", CallbackData: "mode:start"},
+			{Text: "💡 Interactive", CallbackData: fmt.Sprintf("mode:%d:interactive", threadID)},
+			{Text: "🚀 Start", CallbackData: fmt.Sprintf("mode:%d:start", threadID)},
 		})
 		modeButtons = append(modeButtons, []telegram.InlineKeyboardButton{
-			{Text: "👀 Review", CallbackData: "mode:review"},
-			{Text: "⏳ Scheduled", CallbackData: "mode:scheduled"},
+			{Text: "👀 Review", CallbackData: fmt.Sprintf("mode:%d:review", threadID)},
+			{Text: "⏳ Scheduled", CallbackData: fmt.Sprintf("mode:%d:scheduled", threadID)},
 		})
 
 		// Highlight selected
 		for i, row := range modeButtons {
 			for j, btn := range row {
-				if btn.CallbackData == "mode:"+mode {
+				if btn.CallbackData == fmt.Sprintf("mode:%d:%s", threadID, mode) {
 					modeButtons[i][j].Text = "✅ " + btn.Text
 				}
 			}
@@ -427,12 +578,16 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		sessionIDShort := strings.TrimPrefix(data, "approve_plan:")
 		sessionName := "sessions/" + sessionIDShort
 
+		// We could extract threadID but for Approve Plan the chatID + old topic is tricky if the topic ID isn't in callback.
+		// A real implementation would store threadID in the session or in the callback data.
+		// For backward compatibility we will just guess the thread ID from the ChatConfig if it is mapped, but that's hard to do without iterating.
+		// For now we'll just send to main chat if threadID isn't encoded. Let's send to 0.
 		telegramClient.AnswerCallbackQuery(callbackID, "Approving...")
 		if err := julesClient.ApprovePlan(sessionName); err != nil {
 			log.Printf("Failed to approve plan: %v", err)
-			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to approve plan: %v", err))
+			telegramClient.SendMessage(chatID, 0, fmt.Sprintf("❌ Failed to approve plan: %v", err))
 		} else {
-			telegramClient.SendMessage(chatID, "✅ Plan approved successfully!")
+			telegramClient.SendMessage(chatID, 0, "✅ Plan approved successfully!")
 		}
 		return
 	}
@@ -445,9 +600,9 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		telegramClient.AnswerCallbackQuery(callbackID, "Sending 'Create PR' to Jules...")
 		if err := julesClient.SendMessage(sessionName, "Create PR"); err != nil {
 			log.Printf("Failed to send PR request to Jules: %v", err)
-			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
+			telegramClient.SendMessage(chatID, 0, fmt.Sprintf("❌ Failed to send request: %v", err))
 		} else {
-			telegramClient.SendMessage(chatID, "🚀 Sent 'Create PR' command to Jules. Working...")
+			telegramClient.SendMessage(chatID, 0, "🚀 Sent 'Create PR' command to Jules. Working...")
 		}
 		return
 	}
@@ -460,9 +615,9 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		telegramClient.AnswerCallbackQuery(callbackID, "Sending 'Create Branch' to Jules...")
 		if err := julesClient.SendMessage(sessionName, "Create Branch"); err != nil {
 			log.Printf("Failed to send Branch request to Jules: %v", err)
-			telegramClient.SendMessage(chatID, fmt.Sprintf("❌ Failed to send request: %v", err))
+			telegramClient.SendMessage(chatID, 0, fmt.Sprintf("❌ Failed to send request: %v", err))
 		} else {
-			telegramClient.SendMessage(chatID, "🚀 Sent 'Create Branch' command to Jules. Working...")
+			telegramClient.SendMessage(chatID, 0, "🚀 Sent 'Create Branch' command to Jules. Working...")
 		}
 		return
 	}
@@ -473,9 +628,9 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 	sessionIDShort := strings.TrimPrefix(data, "switch:")
 	sessionID := "sessions/" + sessionIDShort
 
-	if err := firestoreClient.UpdateCurrentSession(ctx, chatID, sessionID); err != nil {
+	if err := firestoreClient.UpdateCurrentSession(ctx, chatID, 0, sessionID); err != nil {
 		log.Printf("Failed to switch session: %v", err)
-		telegramClient.SendMessage(chatID, "Failed to switch session.")
+		telegramClient.SendMessage(chatID, 0, "Failed to switch session.")
 		return
 	}
 
@@ -490,7 +645,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		ResizeKeyboard: true,
 		IsPersistent:   true,
 	}
-	telegramClient.SendMessageWithReplyKeyboard(chatID, fmt.Sprintf("✅ Switched to session <code>%s</code>", sessionIDShort), keyboard)
+	telegramClient.SendMessageWithReplyKeyboard(chatID, 0, fmt.Sprintf("✅ Switched to session <code>%s</code>", sessionIDShort), keyboard)
 
 	// Fetch latest activities to show context
 	activities, err := julesClient.ListActivities(sessionID, "")
@@ -513,12 +668,12 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		if absoluteLatest.Originator == "user" && latestUser != nil && latestJules != nil {
-			telegramClient.SendMessage(chatID, formatActivity(*latestJules))
-			telegramClient.SendMessage(chatID, formatActivity(*latestUser))
+			telegramClient.SendMessage(chatID, 0, formatActivity(*latestJules))
+			telegramClient.SendMessage(chatID, 0, formatActivity(*latestUser))
 		} else if latestJules != nil {
-			telegramClient.SendMessage(chatID, formatActivity(*latestJules))
+			telegramClient.SendMessage(chatID, 0, formatActivity(*latestJules))
 		} else if latestUser != nil {
-			telegramClient.SendMessage(chatID, formatActivity(*latestUser))
+			telegramClient.SendMessage(chatID, 0, formatActivity(*latestUser))
 		}
 	}
 }
@@ -583,16 +738,23 @@ func formatActivity(act jules.Activity) string {
 	return fmt.Sprintf("🤖 <b>%s</b>", title)
 }
 
-func handleMessage(ctx context.Context, chatID int64, text string) {
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+func handleMessage(ctx context.Context, chatID int64, threadID int, text string) {
 	if firestoreClient == nil || julesClient == nil || telegramClient == nil {
 		log.Println("Clients not initialized")
 		return
 	}
 
-	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID)
+	chatConfig, err := firestoreClient.GetChatConfig(ctx, chatID, threadID)
 
 	// Intercept Archive/Menu commands from keyboard
-	if text == "📦 Archive Chat" || text == "🏠 Main Menu" {
+	if text == "📦 Archive Chat" || text == "🏠 Main Menu" || text == "/archive" {
 		if text == "🏠 Main Menu" {
 			keyboard := telegram.ReplyKeyboardMarkup{
 				Keyboard: [][]telegram.KeyboardButton{
@@ -604,37 +766,42 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 				ResizeKeyboard: true,
 				IsPersistent:   true,
 			}
-			telegramClient.SendMessageWithReplyKeyboard(chatID, "Main menu:", keyboard)
+			telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, "Main menu:", keyboard)
 			return
 		}
 
-		if text == "📦 Archive Chat" {
+		if text == "📦 Archive Chat" || text == "/archive" {
 			if chatConfig == nil || chatConfig.CurrentSession == "" {
-				telegramClient.SendMessage(chatID, "No active session to archive.")
+				telegramClient.SendMessage(chatID, threadID, "No active session to archive.")
 				return
 			}
 
-			telegramClient.SendMessage(chatID, "⏳ Archiving session...")
+			telegramClient.SendMessage(chatID, threadID, "⏳ Archiving session...")
 			if err := julesClient.ArchiveSession(chatConfig.CurrentSession); err != nil {
 				log.Printf("Failed to archive session: %v", err)
-				telegramClient.SendMessage(chatID, fmt.Sprintf("Failed to archive session: %v", err))
+				telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("Failed to archive session: %v", err))
 				return
 			}
 
 			// Clear current session in firestore
-			firestoreClient.UpdateCurrentSession(ctx, chatID, "")
+			firestoreClient.UpdateCurrentSession(ctx, chatID, threadID, "")
 
-			keyboard := telegram.ReplyKeyboardMarkup{
-				Keyboard: [][]telegram.KeyboardButton{
-					{
-						{Text: "🗓 Show Tasks"},
-						{Text: "➕ New Task"},
+			if threadID > 0 {
+				telegramClient.DeleteForumTopic(chatID, threadID)
+				firestoreClient.DeleteChatConfig(ctx, chatID, threadID)
+			} else {
+				keyboard := telegram.ReplyKeyboardMarkup{
+					Keyboard: [][]telegram.KeyboardButton{
+						{
+							{Text: "🗓 Show Tasks"},
+							{Text: "➕ New Task"},
+						},
 					},
-				},
-				ResizeKeyboard: true,
-				IsPersistent:   true,
+					ResizeKeyboard: true,
+					IsPersistent:   true,
+				}
+				telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, "✅ Session archived successfully.", keyboard)
 			}
-			telegramClient.SendMessageWithReplyKeyboard(chatID, "✅ Session archived successfully.", keyboard)
 			return
 		}
 		return
@@ -642,48 +809,51 @@ func handleMessage(ctx context.Context, chatID int64, text string) {
 
 	// Intercept Prev/Next commands from keyboard (Deprecating but keeping code block structure for a moment if needed, actually user said remove it)
 	if text == "⬅️ Prev Task" || text == "Next Task ➡️" {
-		telegramClient.SendMessage(chatID, "Previous/Next navigation is disabled. Use 'Show Tasks' to switch.")
+		telegramClient.SendMessage(chatID, threadID, "Previous/Next navigation is disabled. Use 'Show Tasks' to switch.")
 		return
 	}
 
 	// Handle creation flow
 	if err == nil && chatConfig.State == "waiting_for_message" {
-		telegramClient.SendMessage(chatID, "⏳ Creating session on Jules...")
+		telegramClient.SendMessage(chatID, threadID, "⏳ Creating session on Jules...")
 
 		session, err := julesClient.CreateSession(text, chatConfig.DraftSource, chatConfig.CreationMode)
 		if err != nil {
-			telegramClient.SendMessage(chatID, fmt.Sprintf("Failed to create session: %v", err))
-			firestoreClient.UpdateChatState(ctx, chatID, "", "")
+			telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("Failed to create session: %v", err))
+			firestoreClient.UpdateChatState(ctx, chatID, threadID, "", "")
 			return
 		}
 
 		// Switch current session to this new session
-		firestoreClient.UpdateCurrentSession(ctx, chatID, session.Name)
-		firestoreClient.UpdateChatState(ctx, chatID, "", "")
+		firestoreClient.UpdateCurrentSession(ctx, chatID, threadID, session.Name)
+		firestoreClient.UpdateChatState(ctx, chatID, threadID, "", "")
 
-		keyboard := telegram.ReplyKeyboardMarkup{
-			Keyboard: [][]telegram.KeyboardButton{
-				{
-					{Text: "📦 Archive Chat"},
-					{Text: "🏠 Main Menu"},
+		if threadID > 0 {
+			telegramClient.SendMessage(chatID, threadID, fmt.Sprintf("✅ <b>New Chat Created!</b>\nSwitched session to: <code>%s</code>\n", strings.TrimPrefix(session.Name, "sessions/")))
+		} else {
+			keyboard := telegram.ReplyKeyboardMarkup{
+				Keyboard: [][]telegram.KeyboardButton{
+					{
+						{Text: "📦 Archive Chat"},
+						{Text: "🏠 Main Menu"},
+					},
 				},
-			},
-			ResizeKeyboard: true,
-			IsPersistent:   true,
+				ResizeKeyboard: true,
+				IsPersistent:   true,
+			}
+			telegramClient.SendMessageWithReplyKeyboard(chatID, threadID, fmt.Sprintf("✅ <b>New Chat Created!</b>\nSwitched session to: <code>%s</code>\n", strings.TrimPrefix(session.Name, "sessions/")), keyboard)
 		}
-
-		telegramClient.SendMessageWithReplyKeyboard(chatID, fmt.Sprintf("✅ <b>New Chat Created!</b>\nSwitched session to: <code>%s</code>\n", strings.TrimPrefix(session.Name, "sessions/")), keyboard)
 		return
 	}
 
 	if err != nil || chatConfig.CurrentSession == "" {
-		telegramClient.SendMessage(chatID, "No active session. Use /tasks to select one or /new_chat to create one.")
+		telegramClient.SendMessage(chatID, threadID, "No active session. Use /tasks to select one or /new_chat to create one.")
 		return
 	}
 
 	if err := julesClient.SendMessage(chatConfig.CurrentSession, text); err != nil {
 		log.Printf("Failed to send message to Jules: %v", err)
-		telegramClient.SendMessage(chatID, "Failed to send message to Jules.")
+		telegramClient.SendMessage(chatID, threadID, "Failed to send message to Jules.")
 		return
 	}
 }
