@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"runtime"
 	"strings"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
@@ -118,9 +117,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		// Find the boundary of the current work round (latest completion/failure) in ALL activities
-		// Actually, we should just look for the last approval boundary or just render everything since the last round.
-		// But since we just want to know if the NEW plan needs approval, we can just check `session.State`.
 
 		var hasNewProgress bool = isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
 		progressMsgID := chat.ProgressMessageID
@@ -316,8 +312,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// Explicitly release resources and trigger GC to stay under 256MB
-		runtime.GC()
 		return nil
 	})
 

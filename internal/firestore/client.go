@@ -96,6 +96,11 @@ func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, threadI
 	docID := c.getDocID(chatID, threadID)
 	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
 		{Path: "current_session", Value: sessionID},
+		{Path: "last_activity_id", Value: ""},
+		{Path: "progress_message_id", Value: 0},
+		{Path: "state", Value: ""},
+		{Path: "notified_prs", Value: nil},
+		{Path: "notified_branches", Value: nil},
 	})
 	return err
 }
