@@ -16,6 +16,7 @@ type ChatConfig struct {
 	LastActivityID    string          `firestore:"last_activity_id"`
 	State             string          `firestore:"state"`
 	DraftSource       string          `firestore:"draft_source"`
+	DraftBranch       string          `firestore:"draft_branch"`
 	CreationMode      string          `firestore:"creation_mode"`
 	ProgressMessageID int             `firestore:"progress_message_id"`
 	NotifiedPRs       map[string]bool `firestore:"notified_prs"`
@@ -101,6 +102,14 @@ func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, threadI
 		{Path: "state", Value: ""},
 		{Path: "notified_prs", Value: nil},
 		{Path: "notified_branches", Value: nil},
+	})
+	return err
+}
+
+func (c *Client) UpdateDraftBranch(ctx context.Context, chatID int64, threadID int, draftBranch string) error {
+	docID := c.getDocID(chatID, threadID)
+	_, err := c.client.Collection("chats").Doc(docID).Update(ctx, []firestore.Update{
+		{Path: "draft_branch", Value: draftBranch},
 	})
 	return err
 }

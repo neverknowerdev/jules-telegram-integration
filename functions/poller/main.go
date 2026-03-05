@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	julesClient     *jules.Client
-	firestoreClient *firestore.Client
-	telegramClient  *telegram.Client
+	julesClient     jules.ClientInterface
+	firestoreClient firestore.ClientInterface
+	telegramClient  telegram.ClientInterface
 	projectID       string
 )
 
@@ -45,13 +45,13 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
 	if firestoreClient == nil {
-		var err error
-		firestoreClient, err = firestore.NewClient(ctx, projectID)
+		realFirestoreClient, err := firestore.NewClient(ctx, projectID)
 		if err != nil {
 			log.Printf("Failed to create Firestore client: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+		firestoreClient = realFirestoreClient
 	}
 
 	// 1. Process all chats from Firestore using iterator to save memory
@@ -117,7 +117,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-
 		var hasNewProgress bool = isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
 		progressMsgID := chat.ProgressMessageID
 
@@ -179,15 +178,35 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			if act.SessionCompleted != nil {
 				msg := formatCompletionMessage(session)
 				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-				keyboard := telegram.InlineKeyboardMarkup{
-					InlineKeyboard: [][]telegram.InlineKeyboardButton{
-						{
-							{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
-							{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
-						},
-						{{Text: "🔗 Open in Jules", URL: session.URL}},
-					},
+
+				var inlineButtons [][]telegram.InlineKeyboardButton
+				hasPR := false
+				var prURL string
+
+				for _, output := range session.Outputs {
+					if output.PullRequest != nil && output.PullRequest.URL != "" {
+						hasPR = true
+						prURL = output.PullRequest.URL
+						break
+					}
 				}
+
+				if hasPR {
+					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+						{Text: "🔗 View Pull Request", URL: prURL},
+					})
+				} else {
+					inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+						{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+						{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+					})
+				}
+				inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
+					{Text: "🔗 Open in Jules", URL: session.URL},
+					{Text: "👯 Clone Task", CallbackData: "clone:" + sessionIDShort},
+				})
+
+				keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
 				telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard)
 				continue
 			}
@@ -238,18 +257,33 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Slice strictly to last 15 items to prevent Telegram 4096 char limits entirely
-			if len(allProgressLines) > 15 {
-				allProgressLines = allProgressLines[len(allProgressLines)-15:]
-			}
-
 			if len(allProgressLines) > 0 || progressMsgID == 0 {
 				header := "⚙️ <b>Jules is working on it...</b>\n\n"
-				body := strings.Join(allProgressLines, "\n\n")
-				if body == "" {
-					body = "<i>Jules is thinking...</i>"
+
+				// Instead of an arbitrary 15 item limit, we pack as many as we can fit within ~4000 characters
+				// We iterate backwards (newest to oldest) so we always show the newest.
+				var finalLines []string
+				currentLen := len(header)
+
+				for i := len(allProgressLines) - 1; i >= 0; i-- {
+					lineLen := len(allProgressLines[i]) + 2 // +2 for the \n\n
+					if currentLen + lineLen > 4000 {
+						// Add a truncation indicator at the top if we had to cut lines
+						finalLines = append([]string{"<i>...older steps omitted...</i>"}, finalLines...)
+						break
+					}
+					// Prepend to final lines to maintain chronological order
+					finalLines = append([]string{allProgressLines[i]}, finalLines...)
+					currentLen += lineLen
 				}
-				msg := header + body
+
+				body := strings.Join(finalLines, "\n\n")
+				var msg string
+				if body == "" {
+					msg = strings.TrimSpace(header)
+				} else {
+					msg = header + body
+				}
 
 				if progressMsgID == 0 {
 					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
@@ -259,6 +293,8 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create progress message: %v", chat.ChatID, chat.ThreadID, err)
 					}
 				} else {
+					// Telegram natively shows an "edited" label with time when the text actually changes.
+					// Since we only edit when there's new progress, the text will differ naturally.
 					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
 						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, err)
 						// If edit fails (e.g., message deleted), try sending a new one
@@ -283,7 +319,11 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					keyboard := telegram.InlineKeyboardMarkup{
 						InlineKeyboard: [][]telegram.InlineKeyboardButton{{{Text: "🔗 View Pull Request", URL: prURL}}},
 					}
-					if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard); err == nil {
+
+					telegramClient.UnpinAllChatMessages(chat.ChatID, chat.ThreadID)
+
+					if msgID, err := telegramClient.SendMessageWithKeyboardReturningID(chat.ChatID, chat.ThreadID, msg, keyboard); err == nil {
+						telegramClient.PinChatMessage(chat.ChatID, chat.ThreadID, msgID)
 						firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, chat.ThreadID, prURL)
 						// Update the chat object in memory for subsequent checks within the same poller run
 						if chat.NotifiedPRs == nil {
