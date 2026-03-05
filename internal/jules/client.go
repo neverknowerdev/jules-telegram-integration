@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 var BaseURL = "https://jules.googleapis.com/v1alpha"
@@ -20,8 +22,21 @@ type Client struct {
 func NewClient(apiKey string) *Client {
 	return &Client{
 		ApiKey: apiKey,
-		HTTP:   &http.Client{},
+		HTTP:   &http.Client{Timeout: 15 * time.Second},
 	}
+}
+
+type SourceSummary struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	GithubRepo  struct {
+		Repo string `json:"repo"`
+	} `json:"githubRepo"`
+}
+
+type ListSourcesSummaryResponse struct {
+	Sources       []SourceSummary `json:"sources"`
+	NextPageToken string          `json:"nextPageToken"`
 }
 
 type Source struct {
@@ -43,6 +58,49 @@ type Source struct {
 type ListSourcesResponse struct {
 	Sources       []Source `json:"sources"`
 	NextPageToken string   `json:"nextPageToken"`
+}
+
+func (c *Client) ListSourcesSummary() ([]SourceSummary, error) {
+	var allSources []SourceSummary
+	pageToken := ""
+
+	for {
+		u, _ := url.Parse(BaseURL + "/sources")
+		q := u.Query()
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		u.RawQuery = q.Encode()
+
+		req, err := http.NewRequest("GET", u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("Jules API error: %s", string(body))
+		}
+
+		var result ListSourcesSummaryResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, err
+		}
+
+		allSources = append(allSources, result.Sources...)
+		pageToken = result.NextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+	return allSources, nil
 }
 
 func (c *Client) ListSources() ([]Source, error) {
@@ -86,6 +144,36 @@ func (c *Client) ListSources() ([]Source, error) {
 		}
 	}
 	return allSources, nil
+}
+
+func (c *Client) GetSource(sourceName string) (*Source, error) {
+	if !strings.HasPrefix(sourceName, "sources/") {
+		sourceName = "sources/" + sourceName
+	}
+	url := BaseURL + "/" + sourceName
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Goog-Api-Key", c.ApiKey)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[JULES] GetSource API error: %d %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("Jules API error: %s", string(body))
+	}
+
+	var source Source
+	if err := json.NewDecoder(resp.Body).Decode(&source); err != nil {
+		return nil, err
+	}
+	return &source, nil
 }
 
 type SessionOutput struct {

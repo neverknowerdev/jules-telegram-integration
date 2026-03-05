@@ -17,6 +17,29 @@ type MockJulesClient struct {
 	SentMessages   []string
 }
 
+func (m *MockJulesClient) ListSourcesSummary() ([]jules.SourceSummary, error) {
+	var summaries []jules.SourceSummary
+	for _, s := range m.Sources {
+		summaries = append(summaries, jules.SourceSummary{
+			Name:        s.Name,
+			DisplayName: s.DisplayName,
+			GithubRepo: struct {
+				Repo string `json:"repo"`
+			}{Repo: s.GithubRepo.Repo},
+		})
+	}
+	return summaries, nil
+}
+
+func (m *MockJulesClient) GetSource(sourceName string) (*jules.Source, error) {
+	for _, s := range m.Sources {
+		if s.Name == sourceName {
+			return &s, nil
+		}
+	}
+	return nil, fmt.Errorf("Source not found")
+}
+
 func (m *MockJulesClient) ListSources() ([]jules.Source, error) {
 	return m.Sources, nil
 }
@@ -64,16 +87,16 @@ func (m *MockJulesClient) ApprovePlan(sessionName string) error {
 }
 
 type MockTelegramClient struct {
-	SentMessages          []string
-	SentThreadIDs         []int
-	SentKeyboards         []telegram.InlineKeyboardMarkup
-	SentReplyKeyboards    []telegram.ReplyKeyboardMarkup
-	DeletedTopics         []int
-	CreatedTopics         []string
-	AnsweredCallbackIDs   []string
-	EditedMessages        []string
-	SendMessageReturnID   int
-	CreateTopicReturnID   int
+	SentMessages        []string
+	SentThreadIDs       []int
+	SentKeyboards       []telegram.InlineKeyboardMarkup
+	SentReplyKeyboards  []telegram.ReplyKeyboardMarkup
+	DeletedTopics       []int
+	CreatedTopics       []string
+	AnsweredCallbackIDs []string
+	EditedMessages      []string
+	SendMessageReturnID int
+	CreateTopicReturnID int
 }
 
 func (m *MockTelegramClient) SendMessage(chatID int64, threadID int, text string) error {
@@ -158,8 +181,8 @@ func (m *MockTelegramClient) UnpinAllChatMessages(chatID int64, threadID int) er
 }
 
 type MockFirestoreClient struct {
-	Configs        map[string]*firestore.ChatConfig
-	Updates        []string
+	Configs map[string]*firestore.ChatConfig
+	Updates []string
 }
 
 func NewMockFirestoreClient() *MockFirestoreClient {

@@ -87,7 +87,15 @@ func TelegramWebhook(w http.ResponseWriter, r *http.Request) {
 	// Handle inline keyboard button presses
 	if update.CallbackQuery != nil {
 		cq := update.CallbackQuery
-		handleCallback(ctx, cq.Message.Chat.ID, cq.ID, cq.Data, cq.Message.MessageID)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[PANIC] in handleCallback: %v", r)
+					telegramClient.SendMessage(cq.Message.Chat.ID, cq.Message.MessageThreadID, "A critical error occurred.")
+				}
+			}()
+			handleCallback(ctx, cq.Message.Chat.ID, cq.ID, cq.Data, cq.Message.MessageID)
+		}()
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -179,7 +187,7 @@ func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *
 		return
 	}
 
-	sources, err := julesClient.ListSources()
+	sources, err := julesClient.ListSourcesSummary()
 	if err != nil {
 		telegramClient.SendMessage(chatID, threadID, "Failed to load repos.")
 		return
@@ -215,7 +223,7 @@ func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *
 			repoName = "Unknown Repo"
 		}
 
-		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", idx, repoName))
+		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", idx, escapeHTML(repoName)))
 
 		btn := telegram.InlineKeyboardButton{
 			Text:         fmt.Sprintf("%d", idx),
@@ -439,7 +447,7 @@ func handleCommand(ctx context.Context, chatID int64, threadID int, text string)
 
 		var buttons [][]telegram.InlineKeyboardButton
 
-		sources, err := julesClient.ListSources()
+		sources, err := julesClient.ListSourcesSummary()
 		if err != nil {
 			telegramClient.SendMessage(chatID, threadID, "Failed to load repos.")
 			return
@@ -515,11 +523,9 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		var threadID int
 		fmt.Sscanf(threadIDStr, "%d", &threadID)
 
-		telegramClient.AnswerCallbackQuery(callbackID, "")
-
 		// Need to find full source URL
 		var fullSource string
-		sources, err := julesClient.ListSources()
+		sources, err := julesClient.ListSourcesSummary()
 		if err == nil {
 			for _, s := range sources {
 				if s.GithubRepo.Repo == repoName || s.DisplayName == repoName {
@@ -535,8 +541,15 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		if err := firestoreClient.UpdateChatState(ctx, chatID, threadID, "waiting_for_branch", fullSource); err != nil {
-			log.Printf("Failed to update chat state: %v", err)
-			telegramClient.SendMessage(chatID, threadID, "An error occurred.")
+			log.Printf("[WEBHOOK] Failed to update chat state: %v", err)
+			telegramClient.SendMessage(chatID, threadID, "An error occurred updating the task state.")
+			return
+		}
+
+		source, err := julesClient.GetSource(fullSource)
+		if err != nil {
+			log.Printf("[WEBHOOK] Failed to get source details: %v", err)
+			telegramClient.SendMessage(chatID, threadID, "Failed to load repository details.")
 			return
 		}
 
@@ -545,13 +558,8 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 
 		// Fetch branches for this source
 		var branches []string
-		for _, s := range sources {
-			if s.Name == fullSource {
-				for _, b := range s.GithubRepo.Branches {
-					branches = append(branches, b.DisplayName)
-				}
-				break
-			}
+		for _, b := range source.GithubRepo.Branches {
+			branches = append(branches, b.DisplayName)
 		}
 
 		// If no branches or just main, we can fallback, but let's provide default
@@ -560,12 +568,14 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		idx := 1
-		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", repoName)
-		for _, branch := range branches {
-			msgBuilder += fmt.Sprintf("%d. %s\n", idx, branch)
+		safeRepoName := escapeHTML(repoName)
+		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", safeRepoName)
+		for i, branch := range branches {
+			safeBranch := escapeHTML(branch)
+			msgBuilder += fmt.Sprintf("%d. %s\n", idx, safeBranch)
 			btn := telegram.InlineKeyboardButton{
 				Text:         fmt.Sprintf("%d", idx),
-				CallbackData: fmt.Sprintf("topicbranch:%d:%s", threadID, branch),
+				CallbackData: fmt.Sprintf("topicbranch:%d:%d", threadID, i),
 			}
 			currentRow = append(currentRow, btn)
 
@@ -580,7 +590,17 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: branchButtons}
-		telegramClient.EditMessageText(chatID, messageID, msgBuilder, &keyboard)
+		if err := telegramClient.EditMessageText(chatID, messageID, msgBuilder, &keyboard); err != nil {
+			log.Printf("[WEBHOOK] Failed to edit message: %v", err)
+			// fallback to sending new message if edit fails
+			if err2 := telegramClient.SendMessageWithKeyboard(chatID, threadID, msgBuilder, keyboard); err2 != nil {
+				log.Printf("[WEBHOOK] Fallback SendMessageWithKeyboard also failed: %v", err2)
+			} else {
+				log.Printf("[WEBHOOK] Fallback SendMessageWithKeyboard succeeded")
+			}
+		} else {
+			log.Printf("[WEBHOOK] Message edited successfully")
+		}
 		return
 	}
 
@@ -591,7 +611,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			return
 		}
 		threadIDStr := parts[1]
-		branchName := parts[2]
+		branchIdxOrName := parts[2]
 
 		var threadID int
 		fmt.Sscanf(threadIDStr, "%d", &threadID)
@@ -604,6 +624,31 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			return
 		}
 
+		// Resolve branch name if it's an index
+		branchName := branchIdxOrName
+		var idx int
+		if n, err := fmt.Sscanf(branchIdxOrName, "%d", &idx); err == nil && n == 1 {
+			log.Printf("[WEBHOOK] Resolving branch index %d for source %s", idx, chatConfig.DraftSource)
+			source, err := julesClient.GetSource(chatConfig.DraftSource)
+			if err == nil {
+				var branches []string
+				for _, b := range source.GithubRepo.Branches {
+					branches = append(branches, b.DisplayName)
+				}
+				if len(branches) == 0 {
+					branches = []string{"main"}
+				}
+				if idx >= 0 && idx < len(branches) {
+					branchName = branches[idx]
+					log.Printf("[WEBHOOK] Resolved index %d to branch: %s", idx, branchName)
+				} else {
+					log.Printf("[WEBHOOK] Index %d out of range for %d branches", idx, len(branches))
+				}
+			} else {
+				log.Printf("[WEBHOOK] Failed to resolve branch index: %v", err)
+			}
+		}
+
 		if err := firestoreClient.UpdateDraftBranch(ctx, chatID, threadID, branchName); err != nil {
 			log.Printf("Failed to update draft branch: %v", err)
 		}
@@ -614,13 +659,10 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			// Update the prompt message inline keyboard to reflect the new selected branch
 			// We can re-fetch branches and recreate the inline keyboard
 			var branches []string
-			sources, _ := julesClient.ListSources()
-			for _, s := range sources {
-				if s.Name == chatConfig.DraftSource {
-					for _, b := range s.GithubRepo.Branches {
-						branches = append(branches, b.DisplayName)
-					}
-					break
+			source, _ := julesClient.GetSource(chatConfig.DraftSource)
+			if source != nil {
+				for _, b := range source.GithubRepo.Branches {
+					branches = append(branches, b.DisplayName)
 				}
 			}
 			if len(branches) == 0 {
@@ -637,16 +679,16 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 				repoPart = sourceParts[len(sourceParts)-1]
 			}
 
-			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", repoPart, branchName)
+			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", escapeHTML(repoPart), escapeHTML(branchName))
 
-			for _, branch := range branches {
+			for i, branch := range branches {
 				btnText := fmt.Sprintf("%d", idx)
 				if branch == branchName {
 					btnText = "✅ " + btnText
 				}
 				btn := telegram.InlineKeyboardButton{
 					Text:         btnText,
-					CallbackData: fmt.Sprintf("topicbranch:%d:%s", threadID, branch),
+					CallbackData: fmt.Sprintf("topicbranch:%d:%d", threadID, i),
 				}
 				currentRow = append(currentRow, btn)
 				if len(currentRow) == 5 {
@@ -701,7 +743,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 
 		// Need to find full source URL
 		var fullSource string
-		sources, err := julesClient.ListSources()
+		sources, err := julesClient.ListSourcesSummary()
 		if err == nil {
 			for _, s := range sources {
 				if s.GithubRepo.Repo == repoName || s.DisplayName == repoName {
@@ -716,6 +758,12 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			return
 		}
 
+		source, err := julesClient.GetSource(fullSource)
+		if err != nil {
+			telegramClient.SendMessage(chatID, 0, "Failed to load repository details.")
+			return
+		}
+
 		if err := firestoreClient.UpdateChatState(ctx, chatID, 0, "waiting_for_branch", fullSource); err != nil {
 			log.Printf("Failed to update chat state: %v", err)
 			telegramClient.SendMessage(chatID, 0, "An error occurred.")
@@ -726,13 +774,8 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		var currentRow []telegram.InlineKeyboardButton
 
 		var branches []string
-		for _, s := range sources {
-			if s.Name == fullSource {
-				for _, b := range s.GithubRepo.Branches {
-					branches = append(branches, b.DisplayName)
-				}
-				break
-			}
+		for _, b := range source.GithubRepo.Branches {
+			branches = append(branches, b.DisplayName)
 		}
 
 		if len(branches) == 0 {
@@ -740,12 +783,14 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		idx := 1
-		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", repoName)
-		for _, branch := range branches {
-			msgBuilder += fmt.Sprintf("%d. %s\n", idx, branch)
+		safeRepoName := escapeHTML(repoName)
+		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", safeRepoName)
+		for i, branch := range branches {
+			safeBranch := escapeHTML(branch)
+			msgBuilder += fmt.Sprintf("%d. %s\n", idx, safeBranch)
 			btn := telegram.InlineKeyboardButton{
 				Text:         fmt.Sprintf("%d", idx),
-				CallbackData: fmt.Sprintf("topicbranch:0:%s", branch),
+				CallbackData: fmt.Sprintf("topicbranch:0:%d", i),
 			}
 			currentRow = append(currentRow, btn)
 
@@ -870,6 +915,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 
 		newThreadID, err := telegramClient.CreateForumTopic(chatID, newTitle)
 		if err != nil {
+			log.Printf("Failed to create cloned topic: %v", err)
 			telegramClient.SendMessage(chatID, 0, "❌ Failed to create cloned topic.")
 			return
 		}
