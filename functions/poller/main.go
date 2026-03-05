@@ -67,7 +67,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			if r := recover(); r != nil {
 				errPart := fmt.Sprintf("🚨 <b>Technical Error in Poller</b>\n\n<blockquote>%v</blockquote>", r)
 				if telegramClient != nil {
-					telegramClient.SendMessage(chat.ChatID, errPart)
+					telegramClient.SendMessage(chat.ChatID, chat.ThreadID, errPart)
 				}
 				log.Printf("[POLLER] Panic in chat %d: %v", chat.ChatID, r)
 			}
@@ -86,19 +86,19 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		if isTransitioningToActive {
 			log.Printf("[POLLER] Chat %d: session re-activated (%s -> %s), resetting tracking", chat.ChatID, chat.State, session.State)
-			firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, 0)
+			firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, 0)
 			chat.ProgressMessageID = 0
 		}
 
 		// Update tracked state in Firestore if changed
 		if chat.State != session.State {
-			firestoreClient.UpdateChatState(ctx, chat.ChatID, session.State, chat.DraftSource)
+			firestoreClient.UpdateChatState(ctx, chat.ChatID, chat.ThreadID, session.State, chat.DraftSource)
 			chat.State = session.State
 		}
 
 		activities, err := julesClient.ListActivities(chat.CurrentSession, chat.LastActivityID)
 		if err != nil {
-			log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
+			log.Printf("[POLLER] Failed to list activities for chat %d (Thread %d): %v", chat.ChatID, chat.ThreadID, err)
 			return nil
 		}
 
@@ -106,140 +106,135 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		log.Printf("[POLLER] Chat %d: fetched %d new activities from Jules", chat.ChatID, len(activities))
+		log.Printf("[POLLER] Chat %d (Thread %d): fetched %d NEW activities from Jules (LastActivityID was %q)", chat.ChatID, chat.ThreadID, len(activities), chat.LastActivityID)
 
 		newestID := activities[len(activities)-1].Id
 
-		// All activities returned are now "new" because we filtered in the client
-		newActivities := activities
-
-		// Find the boundary of the current work round (latest completion/failure) in the new activities
-		roundStartIdx := -1
-		for i := len(activities) - 1; i >= 0; i-- {
-			if activities[i].SessionCompleted != nil || activities[i].SessionFailed != nil {
-				roundStartIdx = i
-				break
-			}
+		// First run for this session: just set cursor to newest and skip sending.
+		if chat.LastActivityID == "" {
+			log.Printf("[POLLER] Chat %d (Thread %d): first run, marking newest activity %q and skipping", chat.ChatID, chat.ThreadID, newestID)
+			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, chat.ThreadID, newestID)
+			return nil
 		}
 
-		// Prepare to process activities
-		isWorkStarted := func(planIdx int) bool {
-			// Only check for progress within the current round of new activities
-			for i := roundStartIdx + 1; i < planIdx; i++ {
-				if activities[i].ProgressUpdated.Title != "" || len(activities[i].Artifacts) > 0 {
-					return true
-				}
-			}
-			return false
-		}
 
-		executionPlans := make(map[string]bool)
-		for i, act := range activities {
-			if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && isWorkStarted(i) {
-				executionPlans[act.Id] = true
-			}
-		}
-
-		hasNewProgress := isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
+		var hasNewProgress bool = isTransitioningToActive || (chat.ProgressMessageID == 0 && (session.State == "IN_PROGRESS" || session.State == "PLANNING"))
 		progressMsgID := chat.ProgressMessageID
 
 		// Process actual NEW activities
-		if len(newActivities) > 0 {
-			for _, act := range newActivities {
-				if act.Originator == "user" {
-					continue
-				}
+		for i, act := range activities {
+			if act.Originator == "user" {
+				continue
+			}
 
-				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
-					if executionPlans[act.Id] {
-						hasNewProgress = true
-					} else {
-						log.Printf("[POLLER] Chat %d: sending approval plan", chat.ChatID)
-						progressMsgID = 0
-						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, 0)
-						msg := formatPlan(act)
-						sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
-						keyboard := telegram.InlineKeyboardMarkup{
-							InlineKeyboard: [][]telegram.InlineKeyboardButton{
-								{{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort}},
-							},
-						}
-						telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
+			if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
+				// If this is the LATEST plan and session is AWAITING_PLAN_APPROVAL, it requires approval.
+				isLatestPlan := true
+				for j := i + 1; j < len(activities); j++ {
+					if activities[j].PlanGenerated != nil {
+						isLatestPlan = false
+						break
 					}
-					continue
 				}
 
-				if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
-					msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
-					telegramClient.SendMessage(chat.ChatID, msg)
-					continue
-				}
-
-				// Session failed activity — send error notification immediately
-				if act.SessionFailed != nil {
-					reason := act.SessionFailed.Reason
-					var errMsg string
-					if reason != "" {
-						errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
-					} else {
-						errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
-					}
-					telegramClient.SendMessage(chat.ChatID, errMsg)
-					continue
-				}
-
-				// Session completed activity — send completion notification immediately
-				if act.SessionCompleted != nil {
-					msg := formatCompletionMessage(session)
+				if isLatestPlan && session.State == "AWAITING_PLAN_APPROVAL" {
+					log.Printf("[POLLER] Chat %d (Thread %d): sending approval plan %s", chat.ChatID, chat.ThreadID, act.Id)
+					progressMsgID = 0
+					firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, 0)
+					msg := formatPlan(act)
 					sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
 					keyboard := telegram.InlineKeyboardMarkup{
 						InlineKeyboard: [][]telegram.InlineKeyboardButton{
-							{
-								{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
-								{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
-							},
-							{{Text: "🔗 Open in Jules", URL: session.URL}},
+							{{Text: "✅ Approve Plan", CallbackData: "approve_plan:" + sessionIDShort}},
 						},
 					}
-					telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard)
-					continue
-				}
-
-				if (act.ProgressUpdated != nil && act.ProgressUpdated.Title != "") || len(act.Artifacts) > 0 {
+					telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard)
+				} else {
+					// It's an execution plan (auto-approved) or an old plan. Treat it as progress.
 					hasNewProgress = true
 				}
+				continue
 			}
-			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, newestID)
+
+			if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
+				msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
+				telegramClient.SendMessage(chat.ChatID, chat.ThreadID, msg)
+				continue
+			}
+
+			// Session failed activity — send error notification immediately
+			if act.SessionFailed != nil {
+				reason := act.SessionFailed.Reason
+				var errMsg string
+				if reason != "" {
+					errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
+				} else {
+					errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
+				}
+				telegramClient.SendMessage(chat.ChatID, chat.ThreadID, errMsg)
+				continue
+			}
+
+			// Session completed activity — send completion notification immediately
+			if act.SessionCompleted != nil {
+				msg := formatCompletionMessage(session)
+				sessionIDShort := strings.TrimPrefix(chat.CurrentSession, "sessions/")
+				keyboard := telegram.InlineKeyboardMarkup{
+					InlineKeyboard: [][]telegram.InlineKeyboardButton{
+						{
+							{Text: "🔀 Create PR", CallbackData: "create_pr:" + sessionIDShort},
+							{Text: "🌿 Create Branch", CallbackData: "create_branch:" + sessionIDShort},
+						},
+						{{Text: "🔗 Open in Jules", URL: session.URL}},
+					},
+				}
+				telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard)
+				continue
+			}
+
+			if (act.ProgressUpdated != nil && act.ProgressUpdated.Title != "") || len(act.Artifacts) > 0 {
+				hasNewProgress = true
+			}
 		}
+
+		firestoreClient.UpdateLastActivity(ctx, chat.ChatID, chat.ThreadID, newestID)
 
 		// Rebuild and update the progress message if needed
 		if hasNewProgress {
-			lastApprovedPlanIdx := -1
-			for i := len(activities) - 1; i > roundStartIdx; i-- {
-				if activities[i].PlanGenerated != nil && len(activities[i].PlanGenerated.Plan.Steps) > 0 && !executionPlans[activities[i].Id] {
-					lastApprovedPlanIdx = i
-					break
-				}
-			}
-
-			startIdx := roundStartIdx
-			if lastApprovedPlanIdx > roundStartIdx {
-				startIdx = lastApprovedPlanIdx
-			}
-
+			// Find the boundary of the current work round in ALL fetched activities (which might include old ones due to ListActivities padding)
+			// Actually `activities` only contains NEW activities since `chat.LastActivityID`, unless it's a cold start.
+			// Let's just render all progress updates in `activities`.
 			var allProgressLines []string
-			for i := startIdx + 1; i < len(activities); i++ {
-				act := activities[i]
+			for _, act := range activities {
 				if act.Originator == "user" {
 					continue
 				}
 				ts := formatTimestamp(act.CreateTime)
-				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && executionPlans[act.Id] {
+
+				// Re-evaluate if this plan is an execution plan
+				isExecutionPlan := false
+				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
+					// Check if it's the latest plan AND requires approval
+					isLatestPlan := true
+					for j := 0; j < len(activities); j++ {
+						if activities[j].PlanGenerated != nil && activities[j].CreateTime > act.CreateTime {
+							isLatestPlan = false
+							break
+						}
+					}
+					requiresApproval := isLatestPlan && session.State == "AWAITING_PLAN_APPROVAL"
+					isExecutionPlan = !requiresApproval
+				}
+
+				if isExecutionPlan {
 					if line := formatExecutionPlanLine(act, ts); line != "" {
 						allProgressLines = append(allProgressLines, line)
 					}
-				} else if line := formatProgressLine(act, ts); line != "" {
-					allProgressLines = append(allProgressLines, line)
+				} else if act.PlanGenerated == nil {
+					// Only format standard progress lines if it's not a PlanGenerated
+					if line := formatProgressLine(act, ts); line != "" {
+						allProgressLines = append(allProgressLines, line)
+					}
 				}
 			}
 
@@ -257,21 +252,21 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				msg := header + body
 
 				if progressMsgID == 0 {
-					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
-						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
+					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
+						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, msgID)
 						chat.ProgressMessageID = msgID
 					} else {
-						log.Printf("[POLLER] Chat %d: FAILED to create progress message: %v", chat.ChatID, err)
+						log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create progress message: %v", chat.ChatID, chat.ThreadID, err)
 					}
 				} else {
 					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
-						log.Printf("[POLLER] Chat %d: edit failed: %v", chat.ChatID, err)
+						log.Printf("[POLLER] Chat %d (Thread %d): edit failed: %v", chat.ChatID, chat.ThreadID, err)
 						// If edit fails (e.g., message deleted), try sending a new one
-						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
-							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
+						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, chat.ThreadID, msg); err == nil {
+							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, chat.ThreadID, msgID)
 							chat.ProgressMessageID = msgID
 						} else {
-							log.Printf("[POLLER] Chat %d: FAILED to create replacement progress message: %v", chat.ChatID, err)
+							log.Printf("[POLLER] Chat %d (Thread %d): FAILED to create replacement progress message: %v", chat.ChatID, chat.ThreadID, err)
 						}
 					}
 				}
@@ -288,8 +283,8 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					keyboard := telegram.InlineKeyboardMarkup{
 						InlineKeyboard: [][]telegram.InlineKeyboardButton{{{Text: "🔗 View Pull Request", URL: prURL}}},
 					}
-					if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard); err == nil {
-						firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, prURL)
+					if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, chat.ThreadID, msg, keyboard); err == nil {
+						firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, chat.ThreadID, prURL)
 						// Update the chat object in memory for subsequent checks within the same poller run
 						if chat.NotifiedPRs == nil {
 							chat.NotifiedPRs = make(map[string]bool)
@@ -305,8 +300,8 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					branchName := parts[1]
 					if !chat.NotifiedBranches[branchName] {
 						msg := fmt.Sprintf("🌿 <b>New GitHub Branch Created!</b>\n\n<b>Branch:</b> <code>%s</code>", escapeHTML(branchName))
-						if err := telegramClient.SendMessage(chat.ChatID, msg); err == nil {
-							firestoreClient.MarkBranchAsNotified(ctx, chat.ChatID, branchName)
+						if err := telegramClient.SendMessage(chat.ChatID, chat.ThreadID, msg); err == nil {
+							firestoreClient.MarkBranchAsNotified(ctx, chat.ChatID, chat.ThreadID, branchName)
 							// Update the chat object in memory for subsequent checks within the same poller run
 							if chat.NotifiedBranches == nil {
 								chat.NotifiedBranches = make(map[string]bool)

@@ -41,9 +41,117 @@ func TestSendMessage(t *testing.T) {
 	defer func() { BaseURL = originalBaseURL }()
 
 	client := NewClient(token)
-	err := client.SendMessage(123, "hello")
+	err := client.SendMessage(123, 0, "hello")
 	if err != nil {
 		t.Fatalf("Failed to send message: %v", err)
+	}
+}
+
+func TestSendMessageWithThreadID(t *testing.T) {
+	token := "123:test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expectedPath := fmt.Sprintf("/bot%s/sendMessage", token)
+		if r.URL.Path != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
+		}
+
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+
+		if body["text"] != "hello thread" {
+			t.Errorf("Expected text 'hello thread', got %v", body["text"])
+		}
+
+		if fmt.Sprintf("%v", body["message_thread_id"]) != "456" {
+			t.Errorf("Expected message_thread_id 456, got %v", body["message_thread_id"])
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer server.Close()
+
+	originalBaseURL := BaseURL
+	BaseURL = server.URL + "/bot%s"
+	defer func() { BaseURL = originalBaseURL }()
+
+	client := NewClient(token)
+	err := client.SendMessage(123, 456, "hello thread")
+	if err != nil {
+		t.Fatalf("Failed to send message: %v", err)
+	}
+}
+
+func TestDeleteForumTopic(t *testing.T) {
+	token := "123:test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expectedPath := fmt.Sprintf("/bot%s/deleteForumTopic", token)
+		if r.URL.Path != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
+		}
+
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+
+		if fmt.Sprintf("%v", body["chat_id"]) != "123" {
+			t.Errorf("Expected chat_id 123, got %v", body["chat_id"])
+		}
+
+		if fmt.Sprintf("%v", body["message_thread_id"]) != "456" {
+			t.Errorf("Expected message_thread_id 456, got %v", body["message_thread_id"])
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer server.Close()
+
+	originalBaseURL := BaseURL
+	BaseURL = server.URL + "/bot%s"
+	defer func() { BaseURL = originalBaseURL }()
+
+	client := NewClient(token)
+	err := client.DeleteForumTopic(123, 456)
+	if err != nil {
+		t.Fatalf("Failed to delete forum topic: %v", err)
+	}
+}
+
+func TestCreateForumTopic(t *testing.T) {
+	token := "123:test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expectedPath := fmt.Sprintf("/bot%s/createForumTopic", token)
+		if r.URL.Path != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
+		}
+
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+
+		if fmt.Sprintf("%v", body["chat_id"]) != "123" {
+			t.Errorf("Expected chat_id 123, got %v", body["chat_id"])
+		}
+
+		if body["name"] != "New Topic" {
+			t.Errorf("Expected name 'New Topic', got %v", body["name"])
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true, "result": {"message_thread_id": 456}}`))
+	}))
+	defer server.Close()
+
+	originalBaseURL := BaseURL
+	BaseURL = server.URL + "/bot%s"
+	defer func() { BaseURL = originalBaseURL }()
+
+	client := NewClient(token)
+	threadID, err := client.CreateForumTopic(123, "New Topic")
+	if err != nil {
+		t.Fatalf("Failed to create forum topic: %v", err)
+	}
+	if threadID != 456 {
+		t.Fatalf("Expected threadID 456, got %d", threadID)
 	}
 }
 
