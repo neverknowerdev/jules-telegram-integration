@@ -239,7 +239,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 				inlineButtons = append(inlineButtons, []telegram.InlineKeyboardButton{
 					{Text: "🔗 Open in Jules", URL: session.URL},
-					{Text: "👯 Clone Task", CallbackData: "clone:" + sessionIDShort},
 				})
 
 				keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: inlineButtons}
@@ -285,7 +284,11 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				} else if act.PlanGenerated == nil {
 					// Only format standard progress lines if it's not a PlanGenerated
 					if line := formatProgressLine(act, ts); line != "" {
-						allProgressLines = append(allProgressLines, line)
+						if strings.HasSuffix(line, "📝 Working...") && len(allProgressLines) > 0 && strings.HasSuffix(allProgressLines[len(allProgressLines)-1], "📝 Working...") {
+							allProgressLines[len(allProgressLines)-1] = line
+						} else {
+							allProgressLines = append(allProgressLines, line)
+						}
 					}
 				}
 			}
