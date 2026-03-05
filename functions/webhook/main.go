@@ -493,7 +493,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 	telegramClient.SendMessageWithReplyKeyboard(chatID, fmt.Sprintf("✅ Switched to session <code>%s</code>", sessionIDShort), keyboard)
 
 	// Fetch latest activities to show context
-	activities, err := julesClient.ListActivities(sessionID)
+	activities, err := julesClient.ListActivities(sessionID, "")
 	if err == nil && len(activities) > 0 {
 		var latestJules *jules.Activity
 		var latestUser *jules.Activity
@@ -541,10 +541,10 @@ func relativeTime(t time.Time) string {
 func formatActivity(act jules.Activity) string {
 	title := "New Activity"
 	desc := ""
-	if act.ProgressUpdated.Title != "" {
+	if act.ProgressUpdated != nil && act.ProgressUpdated.Title != "" {
 		title = act.ProgressUpdated.Title
 		desc = act.ProgressUpdated.Description
-	} else if len(act.PlanGenerated.Plan.Steps) > 0 {
+	} else if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
 		title = "Plan Generated"
 		desc = formatTelegramHTML(act.PlanGenerated.Plan.Title)
 		if desc != "" {
@@ -562,12 +562,12 @@ func formatActivity(act jules.Activity) string {
 		desc = strings.TrimSpace(desc)
 	} else if act.Originator == "user" {
 		title = "You"
-		if act.UserMessaged.UserMessage != "" {
+		if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
 			desc = formatTelegramHTML(act.UserMessaged.UserMessage)
 		}
 	} else if act.Originator == "agent" {
 		title = "Jules"
-		if act.AgentMessaged.AgentMessage != "" {
+		if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
 			desc = formatTelegramHTML(act.AgentMessaged.AgentMessage)
 		}
 	}

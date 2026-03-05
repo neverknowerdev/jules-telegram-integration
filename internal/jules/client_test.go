@@ -64,7 +64,7 @@ func TestListActivities(t *testing.T) {
 	defer func() { BaseURL = originalBaseURL }()
 
 	client := NewClient("test-key")
-	activities, err := client.ListActivities("sessions/1")
+	activities, err := client.ListActivities("sessions/1", "")
 	if err != nil {
 		t.Fatalf("Failed to list activities: %v", err)
 	}

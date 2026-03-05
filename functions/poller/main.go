@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
@@ -54,21 +55,30 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	chats, err := firestoreClient.GetAllChats(ctx)
-	if err != nil {
-		log.Printf("Failed to get chats: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
+	// 1. Process all chats from Firestore using iterator to save memory
+	err := firestoreClient.IterateAllChats(ctx, func(chat firestore.ChatConfig) error {
+		if chat.CurrentSession == "" {
+			return nil
+		}
 
-	log.Printf("[POLLER] Found %d chats", len(chats))
+		log.Printf("[POLLER] Processing chat %d", chat.ChatID)
 
-	for _, chat := range chats {
-		// 1. Fetch current session details immediately
+		// Defer a recover within the loop to catch panics per chat
+		defer func() {
+			if r := recover(); r != nil {
+				errPart := fmt.Sprintf("🚨 <b>Technical Error in Poller</b>\n\n<blockquote>%v</blockquote>", r)
+				if telegramClient != nil {
+					telegramClient.SendMessage(chat.ChatID, errPart)
+				}
+				log.Printf("[POLLER] Panic in chat %d: %v", chat.ChatID, r)
+			}
+		}()
+
+		// Fetch current session details from Jules
 		session, err := julesClient.GetSession(chat.CurrentSession)
 		if err != nil {
 			log.Printf("[POLLER] Chat %d: failed to get session: %v", chat.ChatID, err)
-			continue
+			return nil
 		}
 
 		// 2. Detect session state transitions (e.g. COMPLETED -> IN_PROGRESS)
@@ -87,14 +97,17 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			chat.State = session.State
 		}
 
-		activities, err := julesClient.ListActivities(chat.CurrentSession)
+		activities, err := julesClient.ListActivities(chat.CurrentSession, chat.LastActivityID)
 		if err != nil {
 			log.Printf("Failed to list activities for chat %d: %v", chat.ChatID, err)
-			continue
+			return nil
 		}
 
-		log.Printf("[POLLER] Chat %d: fetched %d activities from Jules (oldest=%q newest=%q)",
-			chat.ChatID, len(activities), activities[0].Id, activities[len(activities)-1].Id)
+		if len(activities) == 0 {
+			return nil
+		}
+
+		log.Printf("[POLLER] Chat %d: fetched %d new activities from Jules", chat.ChatID, len(activities))
 
 		newestID := activities[len(activities)-1].Id
 
@@ -102,23 +115,13 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		if chat.LastActivityID == "" {
 			log.Printf("[POLLER] Chat %d: first run, marking newest activity %q and skipping", chat.ChatID, newestID)
 			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, newestID)
-			continue
+			return nil
 		}
 
-		// Find the index of the last-seen activity
-		var newActivities []jules.Activity
-		foundLast := false
-		for i, act := range activities {
-			if act.Id == chat.LastActivityID {
-				foundLast = true
-				newActivities = activities[i+1:]
-				break
-			}
-		}
+		// All activities returned are now "new" because we filtered in the client
+		newActivities := activities
 
-		log.Printf("[POLLER] Chat %d: foundLast=%v newActivities=%d", chat.ChatID, foundLast, len(newActivities))
-
-		// Find the boundary of the current work round (latest completion/failure)
+		// Find the boundary of the current work round (latest completion/failure) in the new activities
 		roundStartIdx := -1
 		for i := len(activities) - 1; i >= 0; i-- {
 			if activities[i].SessionCompleted != nil || activities[i].SessionFailed != nil {
@@ -129,7 +132,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		// Prepare to process activities
 		isWorkStarted := func(planIdx int) bool {
-			// Only check for progress within the current round
+			// Only check for progress within the current round of new activities
 			for i := roundStartIdx + 1; i < planIdx; i++ {
 				if activities[i].ProgressUpdated.Title != "" || len(activities[i].Artifacts) > 0 {
 					return true
@@ -140,7 +143,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 		executionPlans := make(map[string]bool)
 		for i, act := range activities {
-			if len(act.PlanGenerated.Plan.Steps) > 0 && isWorkStarted(i) {
+			if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && isWorkStarted(i) {
 				executionPlans[act.Id] = true
 			}
 		}
@@ -155,7 +158,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				if len(act.PlanGenerated.Plan.Steps) > 0 {
+				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
 					if executionPlans[act.Id] {
 						hasNewProgress = true
 					} else {
@@ -174,7 +177,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				if act.AgentMessaged.AgentMessage != "" {
+				if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
 					msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
 					telegramClient.SendMessage(chat.ChatID, msg)
 					continue
@@ -210,7 +213,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				if act.ProgressUpdated.Title != "" || len(act.Artifacts) > 0 {
+				if (act.ProgressUpdated != nil && act.ProgressUpdated.Title != "") || len(act.Artifacts) > 0 {
 					hasNewProgress = true
 				}
 			}
@@ -221,7 +224,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		if hasNewProgress {
 			lastApprovedPlanIdx := -1
 			for i := len(activities) - 1; i > roundStartIdx; i-- {
-				if len(activities[i].PlanGenerated.Plan.Steps) > 0 && !executionPlans[activities[i].Id] {
+				if activities[i].PlanGenerated != nil && len(activities[i].PlanGenerated.Plan.Steps) > 0 && !executionPlans[activities[i].Id] {
 					lastApprovedPlanIdx = i
 					break
 				}
@@ -239,7 +242,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				ts := formatTimestamp(act.CreateTime)
-				if len(act.PlanGenerated.Plan.Steps) > 0 && executionPlans[act.Id] {
+				if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 && executionPlans[act.Id] {
 					if line := formatExecutionPlanLine(act, ts); line != "" {
 						allProgressLines = append(allProgressLines, line)
 					}
@@ -253,23 +256,25 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				allProgressLines = allProgressLines[len(allProgressLines)-15:]
 			}
 
-			// Even if 0 progress lines, if we just restarted we may need to post the "working" header
 			if len(allProgressLines) > 0 || progressMsgID == 0 {
 				header := "⚙️ <b>Jules is working on it...</b>\n\n"
 				body := strings.Join(allProgressLines, "\n\n")
+				if body == "" {
+					body = "<i>Jules is thinking...</i>"
+				}
 				msg := header + body
 
 				if progressMsgID == 0 {
 					if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
 						firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
-						chat.ProgressMessageID = msgID // keep local state in sync
+						chat.ProgressMessageID = msgID
 					} else {
 						log.Printf("[POLLER] Chat %d: FAILED to create progress message: %v", chat.ChatID, err)
 					}
 				} else {
 					if err := telegramClient.EditMessageText(chat.ChatID, progressMsgID, msg, nil); err != nil {
 						log.Printf("[POLLER] Chat %d: edit failed: %v", chat.ChatID, err)
-						// If edit fails (e.g. message deleted or too old), try sending a new one
+						// If edit fails (e.g., message deleted), try sending a new one
 						if msgID, err := telegramClient.SendMessageReturningID(chat.ChatID, msg); err == nil {
 							firestoreClient.UpdateProgressMessageID(ctx, chat.ChatID, msgID)
 							chat.ProgressMessageID = msgID
@@ -293,6 +298,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 					}
 					if err := telegramClient.SendMessageWithKeyboard(chat.ChatID, msg, keyboard); err == nil {
 						firestoreClient.MarkPRAsNotified(ctx, chat.ChatID, prURL)
+						// Update the chat object in memory for subsequent checks within the same poller run
 						if chat.NotifiedPRs == nil {
 							chat.NotifiedPRs = make(map[string]bool)
 						}
@@ -309,6 +315,7 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 						msg := fmt.Sprintf("🌿 <b>New GitHub Branch Created!</b>\n\n<b>Branch:</b> <code>%s</code>", escapeHTML(branchName))
 						if err := telegramClient.SendMessage(chat.ChatID, msg); err == nil {
 							firestoreClient.MarkBranchAsNotified(ctx, chat.ChatID, branchName)
+							// Update the chat object in memory for subsequent checks within the same poller run
 							if chat.NotifiedBranches == nil {
 								chat.NotifiedBranches = make(map[string]bool)
 							}
@@ -318,7 +325,15 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		// Explicitly release resources and trigger GC to stay under 256MB
+		runtime.GC()
+		return nil
+	})
 
+	if err != nil {
+		log.Printf("Error iterating chats: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -326,6 +341,9 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 
 func formatPlan(act jules.Activity) string {
 	title := "📋 Plan Generated"
+	if act.PlanGenerated == nil {
+		return title
+	}
 	desc := formatTelegramHTML(act.PlanGenerated.Plan.Title)
 	if desc != "" {
 		desc += "\n\n"
@@ -359,6 +377,9 @@ func formatAgentMessage(text string) string {
 }
 
 func formatExecutionPlanLine(act jules.Activity, ts string) string {
+	if act.PlanGenerated == nil {
+		return ""
+	}
 	stepCount := len(act.PlanGenerated.Plan.Steps)
 	planTitle := act.PlanGenerated.Plan.Title
 	if planTitle == "" {
@@ -377,7 +398,7 @@ func formatExecutionPlanLine(act jules.Activity, ts string) string {
 }
 
 func formatProgressLine(act jules.Activity, ts string) string {
-	if act.ProgressUpdated.Title != "" {
+	if act.ProgressUpdated != nil && act.ProgressUpdated.Title != "" {
 		title := formatTelegramHTML(act.ProgressUpdated.Title)
 		if act.ProgressUpdated.Description != "" {
 			descText := act.ProgressUpdated.Description

@@ -104,22 +104,25 @@ func (c *Client) MarkBranchAsNotified(ctx context.Context, chatID int64, branchN
 	return err
 }
 
-func (c *Client) GetAllChats(ctx context.Context) ([]ChatConfig, error) {
-	var chats []ChatConfig
+func (c *Client) IterateAllChats(ctx context.Context, fn func(ChatConfig) error) error {
 	iter := c.client.Collection("chats").Documents(ctx)
+	defer iter.Stop()
 	for {
 		doc, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var chat ChatConfig
 		if err := doc.DataTo(&chat); err != nil {
-			return nil, err
+			return err
 		}
-		chats = append(chats, chat)
+		if err := fn(chat); err != nil {
+			// Log error but continue iterating other chats
+			fmt.Printf("[FIRESTORE] Error in chat callback: %v\n", err)
+		}
 	}
-	return chats, nil
+	return nil
 }
