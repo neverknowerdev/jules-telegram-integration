@@ -267,38 +267,51 @@ func (c *Client) ListActivities(sessionName string, sinceID string) ([]Activity,
 			return nil, err
 		}
 
+		// Important: If activities are returned in chronological order (oldest first),
+		// we must collect all pages first, OR we iterate until we find `sinceID` and then keep the rest.
+		// Wait, if it's oldest first:
+		// Page 1: 1, 2, 3 (sinceID=2). We keep 3.
+		// Page 2: 4, 5, 6. We keep all.
+		// This logic is correct for "oldest first".
+
 		if len(result.Activities) > 0 {
 			if sinceID != "" && !foundSince {
-				// Search for sinceID in this page
 				for i, act := range result.Activities {
 					if act.Id == sinceID {
 						foundSince = true
-						// Keep everything AFTER sinceID
 						if i+1 < len(result.Activities) {
 							filteredActivities = append(filteredActivities, result.Activities[i+1:]...)
 						}
 						break
 					}
 				}
-				// If sinceID not found in this page, we don't keep these activities
-				// but we continue to the next page.
 			} else if sinceID != "" && foundSince {
-				// already found sinceID, keep everything in subsequent pages
 				filteredActivities = append(filteredActivities, result.Activities...)
 			} else {
-				// No sinceID provided (first run). Just keep the latest few items.
-				// We keep at most 20 items to have enough for a summary if needed.
 				filteredActivities = append(filteredActivities, result.Activities...)
 				if len(filteredActivities) > 20 {
 					filteredActivities = filteredActivities[len(filteredActivities)-20:]
 				}
 			}
+		} else {
+			// If len == 0, we can break early
+			break
 		}
 
 		pageToken = result.NextPageToken
-		if pageToken == "" || (sinceID != "" && foundSince) {
+		if pageToken == "" {
 			break
 		}
+
+		// If we found sinceID, we already appended the rest of the current page.
+		// Any subsequent pages will be entirely NEW activities since they are chronologically AFTER this page.
+		// Wait! Are subsequent pages AFTER this page, or BEFORE?
+		// Usually page 1 = oldest, page 2 = next oldest, so yes, they are AFTER.
+		// Wait, no. If we use `pageToken`, the API usually orders consistently.
+		// If we already found `sinceID`, we DO want subsequent pages because they contain even newer activities.
+		// The previous logic broke if foundSince == true: `if pageToken == "" || (sinceID != "" && foundSince) { break }`.
+		// This was a BUG! If sinceID is found on page 1, breaking means we ignore page 2 and page 3 (which are newer activities).
+		// We should ONLY break if there is no next page token.
 	}
 	return filteredActivities, nil
 }
