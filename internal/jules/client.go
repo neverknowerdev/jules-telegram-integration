@@ -296,7 +296,7 @@ func (c *Client) ListActivities(sessionName string, sinceID string) ([]Activity,
 		}
 
 		pageToken = result.NextPageToken
-		if pageToken == "" || (sinceID != "" && foundSince) {
+		if pageToken == "" {
 			break
 		}
 	}

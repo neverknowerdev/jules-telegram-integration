@@ -57,6 +57,11 @@ func (c *Client) GetChatConfig(ctx context.Context, chatID int64) (*ChatConfig, 
 func (c *Client) UpdateCurrentSession(ctx context.Context, chatID int64, sessionID string) error {
 	_, err := c.client.Collection("chats").Doc(fmt.Sprintf("%d", chatID)).Update(ctx, []firestore.Update{
 		{Path: "current_session", Value: sessionID},
+		{Path: "last_activity_id", Value: ""},
+		{Path: "progress_message_id", Value: 0},
+		{Path: "state", Value: ""},
+		{Path: "notified_prs", Value: nil},
+		{Path: "notified_branches", Value: nil},
 	})
 	return err
 }

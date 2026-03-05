@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"runtime"
 	"strings"
 
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
@@ -110,13 +109,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[POLLER] Chat %d: fetched %d new activities from Jules", chat.ChatID, len(activities))
 
 		newestID := activities[len(activities)-1].Id
-
-		// First run for this session: just set cursor to newest and skip sending.
-		if chat.LastActivityID == "" {
-			log.Printf("[POLLER] Chat %d: first run, marking newest activity %q and skipping", chat.ChatID, newestID)
-			firestoreClient.UpdateLastActivity(ctx, chat.ChatID, newestID)
-			return nil
-		}
 
 		// All activities returned are now "new" because we filtered in the client
 		newActivities := activities
@@ -325,8 +317,6 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// Explicitly release resources and trigger GC to stay under 256MB
-		runtime.GC()
 		return nil
 	})
 
