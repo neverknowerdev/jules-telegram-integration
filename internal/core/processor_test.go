@@ -1,9 +1,7 @@
-package poller
+package core
 
 import (
-	"bytes"
-	"net/http"
-	"net/http/httptest"
+	"context"
 	"strings"
 	"testing"
 
@@ -12,7 +10,7 @@ import (
 	"github.com/neverknowerdev/jules-telegram-bot/internal/mocks"
 )
 
-func setupMocks() (*mocks.MockTelegramClient, *mocks.MockJulesClient, *mocks.MockFirestoreClient) {
+func setupMocks() (*mocks.MockTelegramClient, *mocks.MockJulesClient, *mocks.MockFirestoreClient, *Processor) {
 	tc := &mocks.MockTelegramClient{}
 	jc := &mocks.MockJulesClient{
 		Sessions: []jules.Session{
@@ -29,45 +27,42 @@ func setupMocks() (*mocks.MockTelegramClient, *mocks.MockJulesClient, *mocks.Moc
 	}
 	fc := mocks.NewMockFirestoreClient()
 
-	// Inject into the package-level variables
-	telegramClient = tc
-	julesClient = jc
-	firestoreClient = fc
-	projectID = "test-project" // Avoid calling initEnv()
+	p := NewProcessor(jc, fc, tc, nil)
 
-	return tc, jc, fc
+	return tc, jc, fc, p
 }
 
-func sendPollerRequest(t *testing.T) *httptest.ResponseRecorder {
-	req, _ := http.NewRequest("POST", "/", bytes.NewBuffer(nil))
-	rr := httptest.NewRecorder()
-	JulesPoller(rr, req)
-	return rr
-}
+func TestProcessor_EmptyChats(t *testing.T) {
+	tc, _, fc, p := setupMocks()
 
-func TestPoller_EmptyChats(t *testing.T) {
-	tc, _, _ := setupMocks()
-
-	rr := sendPollerRequest(t)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", rr.Code)
+	chat := &firestore.ChatConfig{
+		ChatID:   123,
+		ThreadID: 456,
+		// No current session
 	}
+	fc.Configs["123_456"] = chat
+
+	err := p.ProcessChat(context.Background(), chat)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
+	}
+
 	if len(tc.SentMessages) != 0 {
 		t.Errorf("Expected no messages sent")
 	}
 }
 
-func TestPoller_NewActivities(t *testing.T) {
-	tc, jc, fc := setupMocks()
+func TestProcessor_NewActivities(t *testing.T) {
+	tc, jc, fc, p := setupMocks()
 
-	fc.Configs["123_456"] = &firestore.ChatConfig{
+	chat := &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/1",
 		State:          "IN_PROGRESS",
 		LastActivityID: "act0",
 	}
+	fc.Configs["123_456"] = chat
 
 	jc.Activities = []jules.Activity{
 		{
@@ -87,13 +82,11 @@ func TestPoller_NewActivities(t *testing.T) {
 		},
 	}
 
-	rr := sendPollerRequest(t)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", rr.Code)
+	err := p.ProcessChat(context.Background(), chat)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
 	}
 
-	// Verify agent message sent
 	foundAgentMessage := false
 	for _, msg := range tc.SentMessages {
 		if strings.Contains(msg, "Hello from Jules") {
@@ -104,11 +97,7 @@ func TestPoller_NewActivities(t *testing.T) {
 		t.Errorf("Expected agent message to be sent")
 	}
 
-	// Verify progress message updated
 	config := fc.Configs["123_456"]
-	// The mock telegram client returns 0 for SendMessageReturnID, so we expect 0 unless we explicitly mock a return ID
-	// Let's modify the setup or check to reflect this.
-	// We'll just verify the last activity ID is updated for now.
 	if config.LastActivityID != "act2" {
 		t.Errorf("Expected last activity to be updated to act2, got %s", config.LastActivityID)
 	}
@@ -123,7 +112,6 @@ func TestPoller_NewActivities(t *testing.T) {
 		t.Errorf("Expected progress message to be sent")
 	}
 
-	// Test if it edits existing message properly with new content
 	config.ProgressMessageID = 999
 	jc.Activities = append(jc.Activities, jules.Activity{
 		Id:         "act3",
@@ -133,10 +121,12 @@ func TestPoller_NewActivities(t *testing.T) {
 			Description string `json:"description"`
 		}{Title: "Executing step 3", Description: "Checking more files..."},
 	})
-	rr = sendPollerRequest(t)
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", rr.Code)
+
+	err = p.ProcessChat(context.Background(), chat)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
 	}
+
 	if len(tc.EditedMessages) == 0 {
 		t.Errorf("Expected message to be edited")
 	} else if !strings.Contains(tc.EditedMessages[0], "Executing step 3") {
@@ -144,16 +134,17 @@ func TestPoller_NewActivities(t *testing.T) {
 	}
 }
 
-func TestPoller_SessionCompletedAndPR(t *testing.T) {
-	tc, jc, fc := setupMocks()
+func TestProcessor_SessionCompletedAndPR(t *testing.T) {
+	tc, jc, fc, p := setupMocks()
 
-	fc.Configs["123_456"] = &firestore.ChatConfig{
+	chat := &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
-		CurrentSession: "sessions/2", // This is mocked as COMPLETED with a PR output
+		CurrentSession: "sessions/2",
 		State:          "IN_PROGRESS",
 		LastActivityID: "act0",
 	}
+	fc.Configs["123_456"] = chat
 
 	jc.Activities = []jules.Activity{
 		{
@@ -163,13 +154,11 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 		},
 	}
 
-	rr := sendPollerRequest(t)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", rr.Code)
+	err := p.ProcessChat(context.Background(), chat)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
 	}
 
-	// Expected to receive completion message and PR notification
 	foundCompletion := false
 	foundPR := false
 
@@ -194,7 +183,6 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 		t.Errorf("Expected state to be updated to COMPLETED")
 	}
 
-	// Verify PR view button is present, instead of create PR
 	foundViewPR := false
 	for _, kb := range tc.SentKeyboards {
 		for _, row := range kb.InlineKeyboard {
@@ -213,16 +201,17 @@ func TestPoller_SessionCompletedAndPR(t *testing.T) {
 	}
 }
 
-func TestPoller_SessionFailed(t *testing.T) {
-	tc, jc, fc := setupMocks()
+func TestProcessor_SessionFailed(t *testing.T) {
+	tc, jc, fc, p := setupMocks()
 
-	fc.Configs["123_456"] = &firestore.ChatConfig{
+	chat := &firestore.ChatConfig{
 		ChatID:         123,
 		ThreadID:       456,
 		CurrentSession: "sessions/1",
 		State:          "IN_PROGRESS",
 		LastActivityID: "act0",
 	}
+	fc.Configs["123_456"] = chat
 
 	jc.Activities = []jules.Activity{
 		{
@@ -234,10 +223,9 @@ func TestPoller_SessionFailed(t *testing.T) {
 		},
 	}
 
-	rr := sendPollerRequest(t)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", rr.Code)
+	err := p.ProcessChat(context.Background(), chat)
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
 	}
 
 	foundError := false

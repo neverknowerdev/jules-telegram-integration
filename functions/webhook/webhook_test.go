@@ -38,7 +38,9 @@ func setupMocks() (*mocks.MockTelegramClient, *mocks.MockJulesClient, *mocks.Moc
 			}},
 		},
 		Sessions: []jules.Session{
-			{Name: "sessions/1", Title: "Fix bug", State: "IN_PROGRESS", SourceContext: struct{Source string `json:"source"`}{Source: "sources/github/owner/repo1"}},
+			{Name: "sessions/1", Title: "Fix bug", State: "IN_PROGRESS", SourceContext: struct {
+				Source string `json:"source"`
+			}{Source: "sources/github/owner/repo1"}},
 		},
 	}
 	fc := mocks.NewMockFirestoreClient()
@@ -307,7 +309,7 @@ func TestWebhook_ApprovePlanCallback_RoutedToCorrectThread(t *testing.T) {
 
 	update := telegram.Update{
 		CallbackQuery: &telegram.CallbackQuery{
-			ID: "callback2",
+			ID:   "callback2",
 			Data: "approve_plan:1",
 			Message: &telegram.Message{
 				Chat: &telegram.Chat{ID: 123},

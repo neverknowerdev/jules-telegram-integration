@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/neverknowerdev/jules-telegram-bot/internal/core"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/firestore"
+	"github.com/neverknowerdev/jules-telegram-bot/internal/format"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/jules"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegram"
 	"github.com/neverknowerdev/jules-telegram-bot/internal/telegraph"
@@ -24,6 +26,7 @@ var (
 	telegraphClient *telegraph.Client
 	projectID       string
 	selectedSources []string
+	processor       *core.Processor
 )
 
 func initEnv() {
@@ -194,7 +197,7 @@ func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *
 	}
 
 	var msgBuilder strings.Builder
-	safeTopicName := escapeHTML(topic.Name)
+	safeTopicName := format.EscapeHTML(topic.Name)
 	msgBuilder.WriteString(fmt.Sprintf("💬 <b>Topic '%s' Created!</b>\nSelect a repository to bind to this task:\n\n", safeTopicName))
 
 	var buttons [][]telegram.InlineKeyboardButton
@@ -223,7 +226,7 @@ func handleTopicCreated(ctx context.Context, chatID int64, threadID int, topic *
 			repoName = "Unknown Repo"
 		}
 
-		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", idx, escapeHTML(repoName)))
+		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", idx, format.EscapeHTML(repoName)))
 
 		btn := telegram.InlineKeyboardButton{
 			Text:         fmt.Sprintf("%d", idx),
@@ -568,10 +571,10 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		idx := 1
-		safeRepoName := escapeHTML(repoName)
+		safeRepoName := format.EscapeHTML(repoName)
 		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", safeRepoName)
 		for i, branch := range branches {
-			safeBranch := escapeHTML(branch)
+			safeBranch := format.EscapeHTML(branch)
 			msgBuilder += fmt.Sprintf("%d. %s\n", idx, safeBranch)
 			btn := telegram.InlineKeyboardButton{
 				Text:         fmt.Sprintf("%d", idx),
@@ -679,7 +682,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 				repoPart = sourceParts[len(sourceParts)-1]
 			}
 
-			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", escapeHTML(repoPart), escapeHTML(branchName))
+			msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\n🌿 <b>Base branch:</b> %s\nTask cloned! Select another base branch below, or reply with a new title for this task:\n\n", format.EscapeHTML(repoPart), format.EscapeHTML(branchName))
 
 			for i, branch := range branches {
 				btnText := fmt.Sprintf("%d", idx)
@@ -783,10 +786,10 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 		}
 
 		idx := 1
-		safeRepoName := escapeHTML(repoName)
+		safeRepoName := format.EscapeHTML(repoName)
 		msgBuilder := fmt.Sprintf("✏️ <b>Repository:</b> %s\nSelect base branch for this task:\n\n", safeRepoName)
 		for i, branch := range branches {
-			safeBranch := escapeHTML(branch)
+			safeBranch := format.EscapeHTML(branch)
 			msgBuilder += fmt.Sprintf("%d. %s\n", idx, safeBranch)
 			btn := telegram.InlineKeyboardButton{
 				Text:         fmt.Sprintf("%d", idx),
@@ -1099,7 +1102,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 			// We iterate and post history.
 			for _, act := range activities {
 				if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
-					msg := fmt.Sprintf("👤 <b>User</b>\n%s", formatTelegramHTML(act.UserMessaged.UserMessage))
+					msg := fmt.Sprintf("👤 <b>User</b>\n%s", format.TelegramHTML(act.UserMessaged.UserMessage))
 					telegramClient.SendMessage(chatID, newThreadID, msg)
 				} else if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
 					msg := formatAgentMessage(act.AgentMessaged.AgentMessage)
@@ -1150,7 +1153,7 @@ func handleCallback(ctx context.Context, chatID int64, callbackID string, data s
 					reason := act.SessionFailed.Reason
 					var errMsg string
 					if reason != "" {
-						errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", escapeHTML(reason))
+						errMsg = fmt.Sprintf("⚠️ <b>Jules encountered an error</b>\n\n<blockquote>%s</blockquote>", format.EscapeHTML(reason))
 					} else {
 						errMsg = "⚠️ <b>Jules encountered an error</b>\n\nThe session failed unexpectedly."
 					}
@@ -1286,16 +1289,16 @@ func formatPlan(act jules.Activity) string {
 	if act.PlanGenerated == nil {
 		return title
 	}
-	desc := formatTelegramHTML(act.PlanGenerated.Plan.Title)
+	desc := format.TelegramHTML(act.PlanGenerated.Plan.Title)
 	if desc != "" {
 		desc += "\n\n"
 	}
 	for i, step := range act.PlanGenerated.Plan.Steps {
-		stepTitle := formatTelegramHTML(step.Title)
+		stepTitle := format.TelegramHTML(step.Title)
 		desc += fmt.Sprintf("<b>%d. %s</b>\n", i+1, stepTitle)
 		if step.Description != "" {
 			cleanDesc := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(step.Description), "-"))
-			desc += fmt.Sprintf("<i>%s</i>\n", formatTelegramHTML(cleanDesc))
+			desc += fmt.Sprintf("<i>%s</i>\n", format.TelegramHTML(cleanDesc))
 		}
 		desc += "\n"
 	}
@@ -1309,11 +1312,11 @@ func formatAgentMessage(text string) string {
 		if len(preview) > 100 {
 			preview = preview[:100] + "..."
 		}
-		escapedFull := escapeHTML(text)
+		escapedFull := format.EscapeHTML(text)
 		return fmt.Sprintf("💬 <b>Jules</b>\n%s\n<blockquote expandable>%s</blockquote>",
-			formatTelegramHTML(preview), escapedFull)
+			format.TelegramHTML(preview), escapedFull)
 	}
-	return fmt.Sprintf("💬 <b>Jules</b>\n%s", formatTelegramHTML(text))
+	return fmt.Sprintf("💬 <b>Jules</b>\n%s", format.TelegramHTML(text))
 }
 
 func formatCompletionMessage(session *jules.Session) string {
@@ -1322,15 +1325,15 @@ func formatCompletionMessage(session *jules.Session) string {
 	for _, output := range session.Outputs {
 		if output.PullRequest != nil {
 			msg += fmt.Sprintf("🔀 <b>PR created:</b> <a href=\"%s\">%s</a>\n",
-				output.PullRequest.URL, escapeHTML(output.PullRequest.Title))
+				output.PullRequest.URL, format.EscapeHTML(output.PullRequest.Title))
 		}
 		if output.ChangeSet != nil && output.ChangeSet.GitPatch.SuggestedCommitMessage != "" {
 			commitMsg := output.ChangeSet.GitPatch.SuggestedCommitMessage
 			if len(commitMsg) > 200 {
 				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<blockquote expandable>%s</blockquote>",
-					escapeHTML(commitMsg))
+					format.EscapeHTML(commitMsg))
 			} else {
-				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<i>%s</i>", escapeHTML(commitMsg))
+				msg += fmt.Sprintf("📝 <b>Commit message:</b>\n<i>%s</i>", format.EscapeHTML(commitMsg))
 			}
 		}
 	}
@@ -1339,55 +1342,7 @@ func formatCompletionMessage(session *jules.Session) string {
 }
 
 func formatActivity(act jules.Activity) string {
-	title := "New Activity"
-	desc := ""
-	if act.ProgressUpdated != nil && act.ProgressUpdated.Title != "" {
-		title = act.ProgressUpdated.Title
-		desc = act.ProgressUpdated.Description
-	} else if act.PlanGenerated != nil && len(act.PlanGenerated.Plan.Steps) > 0 {
-		title = "Plan Generated"
-		desc = formatTelegramHTML(act.PlanGenerated.Plan.Title)
-		if desc != "" {
-			desc += "\n\n"
-		}
-		for i, step := range act.PlanGenerated.Plan.Steps {
-			stepTitle := formatTelegramHTML(step.Title)
-			desc += fmt.Sprintf("<b>%d. %s</b>\n", i+1, stepTitle)
-			if step.Description != "" {
-				cleanDesc := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(step.Description), "-"))
-				desc += fmt.Sprintf("<i>%s</i>\n", formatTelegramHTML(cleanDesc))
-			}
-			desc += "\n"
-		}
-		desc = strings.TrimSpace(desc)
-	} else if act.Originator == "user" {
-		title = "You"
-		if act.UserMessaged != nil && act.UserMessaged.UserMessage != "" {
-			desc = formatTelegramHTML(act.UserMessaged.UserMessage)
-		}
-	} else if act.Originator == "agent" {
-		title = "Jules"
-		if act.AgentMessaged != nil && act.AgentMessaged.AgentMessage != "" {
-			desc = formatTelegramHTML(act.AgentMessaged.AgentMessage)
-		}
-	}
-
-	// Escape HTML for title safely
-	title = strings.ReplaceAll(title, "&", "&amp;")
-	title = strings.ReplaceAll(title, "<", "&lt;")
-	title = strings.ReplaceAll(title, ">", "&gt;")
-
-	if desc != "" {
-		return fmt.Sprintf("🤖 <b>%s</b>\n%s", title, desc)
-	}
-	return fmt.Sprintf("🤖 <b>%s</b>", title)
-}
-
-func escapeHTML(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
+	return format.ActivitySummary(act)
 }
 
 func handleMessage(ctx context.Context, chatID int64, threadID int, text string) {
@@ -1512,9 +1467,15 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 		}
 
 		if text == "🔄 Sync" {
-			telegramClient.SendMessage(chatID, threadID, "⏳ Poller will sync updates shortly.")
-			// In a real implementation we could trigger a pubsub message to the poller here.
-			// For now, we just reply to give user feedback.
+			telegramClient.SendMessage(chatID, threadID, "⏳ Syncing updates...")
+			if processor == nil {
+				processor = core.NewProcessor(julesClient, firestoreClient, telegramClient, telegraphClient)
+			}
+			err := processor.ProcessChat(ctx, chatConfig)
+			if err != nil {
+				log.Printf("Failed to sync chat: %v", err)
+				telegramClient.SendMessage(chatID, threadID, "❌ Failed to sync updates.")
+			}
 			return
 		}
 
