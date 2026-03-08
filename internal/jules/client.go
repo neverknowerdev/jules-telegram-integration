@@ -407,6 +407,22 @@ func (c *Client) ListActivities(sessionName string, sinceID string) ([]Activity,
 		// This was a BUG! If sinceID is found on page 1, breaking means we ignore page 2 and page 3 (which are newer activities).
 		// We should ONLY break if there is no next page token.
 	}
+
+	// Fallback: if we were looking for a specific ID but didn't find it (maybe it was deleted or expired),
+	// we should return the latest activities so the poller isn't stuck forever.
+	if sinceID != "" && !foundSince && len(filteredActivities) == 0 {
+		log.Printf("[JULES] ListActivities: sinceID %q not found in any page for %s. Falling back to latest 20 activities.", sinceID, sessionName)
+
+		// Fetch all activities again (or just return the last page we have, but let's be thorough)
+		all, err := c.ListAllActivities(sessionName)
+		if err == nil && len(all) > 0 {
+			if len(all) > 20 {
+				return all[len(all)-20:], nil
+			}
+			return all, nil
+		}
+	}
+
 	return filteredActivities, nil
 }
 

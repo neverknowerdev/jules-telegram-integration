@@ -494,6 +494,14 @@ func handleCommand(ctx context.Context, chatID int64, threadID int, text string)
 		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: buttons}
 		telegramClient.SendMessageWithKeyboard(chatID, threadID, msgBuilder.String(), keyboard)
 
+	case "/unregister", "/stop":
+		if err := firestoreClient.DeleteChatConfig(ctx, chatID, threadID); err != nil {
+			log.Printf("Failed to delete chat config: %v", err)
+			telegramClient.SendMessage(chatID, threadID, "Failed to unregister chat.")
+		} else {
+			telegramClient.SendMessage(chatID, threadID, "✅ Chat unregistered successfully. You will no longer receive updates in this window.")
+		}
+
 	case "/switch":
 		telegramClient.SendMessage(chatID, threadID, "Please use /tasks to select a chat via buttons.")
 
@@ -1512,9 +1520,10 @@ func handleMessage(ctx context.Context, chatID int64, threadID int, text string)
 		}
 
 		if text == "🔄 Sync" {
-			telegramClient.SendMessage(chatID, threadID, "⏳ Poller will sync updates shortly.")
-			// In a real implementation we could trigger a pubsub message to the poller here.
-			// For now, we just reply to give user feedback.
+			log.Printf("[WEBHOOK] Resetting tracking state for chat %d thread %d to force sync", chatID, threadID)
+			firestoreClient.UpdateLastActivity(ctx, chatID, threadID, "")
+			firestoreClient.UpdateProgressMessageID(ctx, chatID, threadID, 0)
+			telegramClient.SendMessage(chatID, threadID, "⏳ Tracking reset. Poller will sync all recent updates shortly.")
 			return
 		}
 

@@ -96,6 +96,12 @@ func JulesPoller(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
+		// Strictly allow updates only for topic-based chats
+		if chat.ThreadID == 0 {
+			log.Printf("[POLLER] Skipping chat %d because it is not a forum topic", chat.ChatID)
+			return nil
+		}
+
 		log.Printf("[POLLER] Processing chat %d", chat.ChatID)
 
 		// Defer a recover within the loop to catch panics per chat
